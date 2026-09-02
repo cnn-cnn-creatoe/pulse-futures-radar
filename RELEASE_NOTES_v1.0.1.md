@@ -10,6 +10,7 @@
 - 记录全部 `X-MBX-USED-WEIGHT-*` 响应头；收到 429/418 后严格按 `Retry-After` 全局停发，不重试触发限速的请求。
 - WebSocket 每连接最多 40 个 streams，并在 24 小时上限前错峰平滑重连。
 - 保留官方额度 45% 的本机调度预算，并在出口 IP 权重偏高时主动冷却。
+- 修复 Windows PowerShell 5.1 解析 GitHub Release 列表时的数组兼容问题，保证后续版本可以从看板一键更新。
 
 ## 数据处理
 

@@ -72,9 +72,14 @@ function Get-ReleaseState {
     $repository = Resolve-Repository
     $releaseText = (& $gh.Source release list --repo $repository --limit 100 --json tagName,publishedAt,isDraft,isPrerelease 2>$null) -join "`n"
     if ($LASTEXITCODE -ne 0) { throw ('无法读取私有仓库 {0} 的版本，请检查账号权限和网络。' -f $repository) }
-    $releases = @($releaseText | ConvertFrom-Json) | Where-Object {
+    # Windows PowerShell 5.1 returns a JSON array as one nested pipeline
+    # value when ConvertFrom-Json is wrapped directly in @(...).  Parse first,
+    # then enumerate and wrap the filtered result so zero/one/many releases
+    # all have a reliable Count property.
+    $parsedReleases = $releaseText | ConvertFrom-Json
+    $releases = @($parsedReleases | Where-Object {
         -not $_.isDraft -and -not $_.isPrerelease -and (Convert-SemVer ([string]$_.tagName))
-    }
+    })
     if ($releases.Count -eq 0) { throw '仓库中还没有可用的稳定 v* Release。' }
 
     $latest = $releases | Sort-Object @{ Expression = { Convert-SemVer ([string]$_.tagName) }; Descending = $true } | Select-Object -First 1
