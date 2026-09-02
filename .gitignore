@@ -1,0 +1,47 @@
+# 本机行情、回测产物和用户配置（不得进入版本库或 Release）
+backend/data/
+回测结果/
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+*.dpapi
+*.log
+*.pid
+.env
+.env.*
+!.env.example
+
+# 本机运行环境与依赖
+.venv/
+.runtime/
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.next/
+dashboard/.vinext/
+dashboard/.wrangler/
+dashboard/.openai/
+dashboard/*.tsbuildinfo
+release/
+打开在线演示.url
+
+# Python / 测试缓存
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.coverage
+htmlcov/
+
+# 压缩包由发布脚本单独生成
+*.zip
+*.tar.gz
+
+# 编辑器和系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
