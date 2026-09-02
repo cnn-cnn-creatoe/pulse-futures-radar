@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import aiohttp
 
-from monitor.collector import (DAY, MINUTE, GAP_WORKERS, INDICATOR_RULES_NOT_CONFIGURED, MONITOR_TIMEFRAMES, OI_WORKERS, MonitorService, eligible_contract, eligible_crypto_perpetual, eligible_um_contract,
+from monitor.collector import (DAY, MINUTE, BinanceRateLimitError, GAP_WORKERS, INDICATOR_RULES_NOT_CONFIGURED, MONITOR_TIMEFRAMES, REST_BUDGET_FRACTION, MonitorService, WeightBudget, eligible_contract, eligible_crypto_perpetual, eligible_um_contract,
                                completion_percentage, rest_candle, retry_after_seconds)
 from monitor.engine import Candle, LOOKBACK, TIMEFRAME_MS
 from monitor.store import DAY_MS, Store, is_trade_qualified, shanghai_day_start
@@ -313,6 +313,8 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.service._request = fake_request
         self.service._kline_stream = fake_stream
         self.service._market_stream = fake_stream
+        self.service._book_stream = lambda: fake_stream([], -1)
+        self.service._market_control_stream = lambda: fake_stream([], -2)
         await self.service._refresh_universe()
         original_tasks = list(self.service._shards)
         original_map = dict(self.service._symbol_shard)
@@ -342,17 +344,27 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
                 cancelled.append(key)
                 active.pop(key, None)
 
+        async def fake_global_stream(family):
+            active[family] = []
+            try:
+                await never.wait()
+            finally:
+                cancelled.append(family)
+                active.pop(family, None)
+
         self.service._request = fake_request
         self.service._kline_stream = lambda symbols, index: fake_stream("kline", symbols, index)
         self.service._market_stream = lambda symbols, index: fake_stream("market", symbols, index)
+        self.service._book_stream = lambda: fake_global_stream("book-ticker")
+        self.service._market_control_stream = lambda: fake_global_stream("market-control")
         await self.service._refresh_universe()
         await asyncio.sleep(0)
         originals = list(self.service._shards)
-        self.assertEqual(len(originals), 30)
-        self.assertEqual(len(active), 30)
+        self.assertEqual(len(originals), 32)
+        self.assertEqual(len(active), 32)
         for index in range(15):
             self.assertEqual(active[f"kline-{index}"], active[f"market-{index}"])
-            self.assertLessEqual(len(active[f"market-{index}"]) * 2, 80)
+            self.assertLessEqual(len(active[f"market-{index}"]), 40)
         all_market = [symbol for name, group in active.items() if name.startswith("market-") for symbol in group]
         self.assertEqual(sorted(all_market), sorted(row["symbol"] for row in symbols))
         symbols = [*symbols[1:], meta("NEWUSDT")]
@@ -361,15 +373,15 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         await self.service._refresh_universe()
         await asyncio.sleep(0)
         self.assertTrue(all(task.cancelled() for task in originals))
-        self.assertEqual(len(cancelled), 30)
-        self.assertEqual(len(active), 30)
+        self.assertEqual(len(cancelled), 32)
+        self.assertEqual(len(active), 32)
         self.assertNotIn("TEST000USDT", self.service._symbol_shard)
         self.assertNotIn("TEST000USDT", self.service._ticker)
         self.assertNotIn("TEST000USDT", self.service._mark)
         self.assertIn("NEWUSDT", self.service._symbol_shard)
         await self.service.stop()
         self.assertEqual(active, {})
-        self.assertEqual(len(cancelled), 60)
+        self.assertEqual(len(cancelled), 64)
         self.assertFalse(self.service._shards)
         self.assertFalse(self.service._tasks)
 
@@ -529,18 +541,67 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(self.service._market_stream([symbol], 2))
         try:
             await asyncio.wait_for(drained.wait(), 2)
-            self.assertIn("中文usdc@miniTicker/中文usdc@markPrice", addresses[0])
+            self.assertIn("中文usdc@markPrice", addresses[0])
+            self.assertNotIn("@miniTicker", addresses[0])
             self.assertNotIn("!", addresses[0])
             self.assertNotIn("@1s", addresses[0])
             self.assertNotIn("otherusdt", addresses[0])
-            self.assertAlmostEqual(self.service._ticker[symbol]["change_pct"], -5)
+            self.assertNotIn(symbol, self.service._ticker)
             self.assertEqual(self.service._mark[symbol], (96, self.now_ms - 500))
             self.assertNotIn("OTHERUSDT", self.service._mark)
             connection = self.service.status()["connections"][0]
             self.assertEqual(connection["name"], "market-2")
-            self.assertEqual(connection["subscriptions"], 2)
-            self.assertEqual(connection["latency_samples"], 2)
+            self.assertEqual(connection["subscriptions"], 1)
+            self.assertEqual(connection["latency_samples"], 1)
             self.assertEqual(connection["event_delay_ms"], 500)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_market_control_websocket_updates_all_tickers_and_requests_scope_refresh(self):
+        self.service._running = True
+        symbol = "1000PEPEUSDT"
+        events = [
+            {"stream": "!miniTicker@arr", "data": [
+                {"e": "24hrMiniTicker", "s": symbol, "st": 1, "E": self.now_ms - 500,
+                 "q": "200", "c": "95", "o": "100"},
+                {"e": "24hrMiniTicker", "s": "CMUSD", "st": 2, "E": self.now_ms - 400,
+                 "q": "999", "c": "1", "o": "1"},
+            ]},
+            {"stream": "!contractInfo", "data": {"e": "contractInfo", "s": "NEWUSDT", "st": 1,
+                "E": self.now_ms - 100, "cs": "TRADING"}},
+        ]
+        drained, never = asyncio.Event(), asyncio.Event()
+        addresses = []
+
+        class FakeSocket:
+            async def __aenter__(inner):
+                return inner
+
+            async def __aexit__(inner, *args):
+                return False
+
+            async def receive(inner):
+                if events:
+                    return SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(events.pop(0)))
+                drained.set()
+                await never.wait()
+
+        def connect(url, **kwargs):
+            addresses.append(url)
+            return FakeSocket()
+
+        self.service._session = SimpleNamespace(ws_connect=connect, close=AsyncMock())
+        task = asyncio.create_task(self.service._market_control_stream())
+        try:
+            await asyncio.wait_for(drained.wait(), 2)
+            self.assertIn("!miniTicker@arr/!contractInfo", addresses[0])
+            self.assertAlmostEqual(self.service._ticker[symbol]["change_pct"], -5)
+            self.assertNotIn("CMUSD", self.service._ticker)
+            self.assertTrue(self.service._refresh_requested.is_set())
+            connection = next(row for row in self.service.status()["connections"]
+                              if row["name"] == "market-control")
+            self.assertEqual(connection["subscriptions"], 2)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -600,6 +661,16 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         status = self.service.status()
         self.assertTrue(status["connections"][0]["content_fresh"])
         self.assertEqual(status["state"], "reconnecting")
+
+    def test_metadata_freshness_follows_control_stream_without_rest_polling(self):
+        self.service._last_refresh = 1
+        self.service._connections["market-control"] = {
+            "state": "connected", "last_message": self.now_ms,
+            "last_event_time": self.now_ms,
+        }
+        self.assertFalse(self.service.status()["metadata_stale"])
+        self.service._connections["market-control"]["last_event_time"] = self.now_ms - 90_001
+        self.assertTrue(self.service.status()["metadata_stale"])
 
     def test_connection_latency_is_bounded_and_transport_cannot_hide_stale_content(self):
         self.service._state = "warming"
@@ -766,97 +837,50 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row.open_time for row in self.store.get_candles(jumped, "1m")],
                          [last, last + 2 * MINUTE])
 
-    async def test_oi_concurrency_is_bounded_and_all_successes_are_saved(self):
-        self.service._running = True
-        symbols = [f"TEST{i}USDT" for i in range(20)]
-        self.service._metadata = {symbol: meta(symbol) for symbol in symbols}
-        full, release = asyncio.Event(), asyncio.Event()
-        active = peak = requests = 0
+    def test_rest_budget_keeps_shared_ip_headroom_and_backs_off_early(self):
+        budget = WeightBudget(2400)
+        self.assertEqual(budget.per_minute, int(2400 * REST_BUDGET_FRACTION))
+        budget.configure(1200)
+        self.assertEqual(budget.per_minute, int(1200 * REST_BUDGET_FRACTION))
+        before = time.monotonic()
+        budget.observe_used(960)
+        self.assertGreaterEqual(budget.cooldown_until, before + 64)
 
-        async def fake_request(path, params=None, weight=1):
-            nonlocal active, peak, requests
-            self.assertEqual(path, "/fapi/v1/openInterest")
-            active += 1
-            requests += 1
-            peak = max(peak, active)
-            if active == OI_WORKERS:
-                full.set()
-            try:
-                await release.wait()
-                return {"openInterest": "12", "time": self.now_ms - 100}
-            finally:
-                active -= 1
+    async def test_request_records_all_weight_headers_and_never_retries_429(self):
+        calls = 0
 
-        self.service._request = fake_request
-        cycle = asyncio.create_task(self.service._oi_cycle(symbols, time.monotonic() - 60))
-        try:
-            await asyncio.wait_for(full.wait(), 2)
-            self.assertEqual(requests, OI_WORKERS)
-            self.assertEqual(self.service._oi_inflight, OI_WORKERS)
-            release.set()
-            await asyncio.wait_for(cycle, 3)
-            self.assertEqual(peak, OI_WORKERS)
-            self.assertEqual(self.service._oi_inflight, 0)
-            self.assertEqual(self.service._oi_cycle_samples, len(symbols))
-            self.assertTrue(all(len(self.store.load_oi(symbol)) == 1 for symbol in symbols))
-        finally:
-            cycle.cancel()
-            await asyncio.gather(cycle, return_exceptions=True)
+        class FakeResponse:
+            status = 429
+            headers = {"X-MBX-USED-WEIGHT-1M": "1888", "X-MBX-USED-WEIGHT-10S": "77",
+                       "Retry-After": "120"}
+            request_info = None
+            history = ()
 
-    async def test_oi_dispatch_is_spaced_and_sample_time_is_after_response(self):
-        self.service._running = True
-        symbols = [f"TEST{i}USDT" for i in range(8)]
-        self.service._metadata = {symbol: meta(symbol) for symbol in symbols}
-        observed = {}
-        delays = []
-        real_sleep = asyncio.sleep
+            async def __aenter__(inner):
+                return inner
 
-        async def fake_sleep(delay):
-            delays.append(delay)
-            await real_sleep(0)
+            async def __aexit__(inner, *args):
+                return False
 
-        async def fake_request(path, params=None, weight=1):
-            self.now_ms += 3000
-            observed[params["symbol"]] = self.now_ms
-            return {"openInterest": "10", "time": self.now_ms - 500}
+        def get(url, params=None):
+            nonlocal calls
+            calls += 1
+            return FakeResponse()
 
-        self.service._request = fake_request
-        with patch("monitor.collector.asyncio.sleep", fake_sleep):
-            await self.service._oi_cycle(symbols, time.monotonic() + 100)
-        self.assertEqual(len(delays), len(symbols))
-        for index, delay in enumerate(sorted(delays)):
-            self.assertAlmostEqual(delay, 100 + index * 60 / len(symbols), delta=.5)
-        for symbol in symbols:
-            sample = self.store.load_oi(symbol)[0]
-            self.assertEqual(sample["timestamp"], observed[symbol])
-            self.assertEqual(sample["source_time"], observed[symbol] - 500)
+        self.service._session = SimpleNamespace(get=get, close=AsyncMock())
+        before = time.monotonic()
+        with self.assertRaises(BinanceRateLimitError) as caught:
+            await self.service._request("/fapi/v1/time")
+        self.assertEqual(caught.exception.status, 429)
+        self.assertEqual(calls, 1)
+        self.assertGreaterEqual(self.service._budget.cooldown_until, before + 119)
+        self.assertEqual(self.service._budget.used_headers, {
+            "X-MBX-USED-WEIGHT-1M": 1888, "X-MBX-USED-WEIGHT-10S": 77})
+        self.assertEqual(self.service._rest_usage_history[-1]["status"], 429)
 
-    async def test_cancelling_oi_cycle_cancels_inflight_children(self):
-        self.service._running = True
-        entered, never = asyncio.Event(), asyncio.Event()
-
-        async def fake_request(path, params=None, weight=1):
-            entered.set()
-            await never.wait()
-
-        self.service._request = fake_request
-        cycle = asyncio.create_task(self.service._oi_cycle(list(self.service._metadata), time.monotonic() - 60))
-        await asyncio.wait_for(entered.wait(), 2)
-        cycle.cancel()
-        await asyncio.gather(cycle, return_exceptions=True)
-        self.assertEqual(self.service._oi_inflight, 0)
-        self.assertEqual(self.store.load_oi("1000PEPEUSDT"), [])
-
-    async def test_oi_sample_rejects_missing_stale_and_future_exchange_time(self):
-        for source_time in (None, self.now_ms - 90_000, self.now_ms + 60_000):
-            async def fake_request(path, params=None, weight=1):
-                return {"openInterest": "10", "time": source_time}
-
-            self.service._request = fake_request
-            await self.service._sample_oi("1000PEPEUSDT")
-        self.assertEqual(self.store.load_oi("1000PEPEUSDT"), [])
-        self.assertEqual(self.service._oi_cycle_samples, 0)
-        self.assertEqual(len(self.service._errors), 3)
+    def test_steady_state_open_interest_rest_poller_is_removed(self):
+        self.assertFalse(hasattr(self.service, "_oi_poller"))
+        self.assertFalse(self.service.status()["scheduler"]["steady_state_open_interest_rest"])
 
     def test_watermark_staleness_and_gap_gate(self):
         self.assertFalse(self.service._can_alert("1000PEPEUSDT", self.now_ms - 1))
@@ -1191,61 +1215,60 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service._clock_offset, 200)
         self.assertEqual(self.service._clock_rtt_ms, 500)
 
-    async def test_spread_allows_small_clock_uncertainty_but_rejects_stale_or_future(self):
-        stamp = self.now_ms + 2000
-
-        async def fake_book(path, params=None, weight=1):
-            return [{"symbol": "1000PEPEUSDT", "bidPrice": "100", "askPrice": "100.01", "time": stamp}]
-
-        self.service._request = fake_book
+    async def test_spread_uses_only_fresh_websocket_book_ticker(self):
+        self.service._request = AsyncMock(side_effect=AssertionError("spread must not call REST"))
+        self.service._consume_book_event({"e": "bookTicker", "s": "1000PEPEUSDT", "st": 1,
+            "E": self.now_ms + 2000, "T": self.now_ms + 1900, "b": "100", "a": "100.01"})
         self.assertGreater(await self.service._spread("1000PEPEUSDT"), 0)
+        self.service._book_cache.clear()
         for stamp in (self.now_ms - 90_001, self.now_ms + 10_000):
-            self.service._book_cache.clear()
-            self.service._book_snapshot_at = 0
-            self.service._book_snapshot_attempt_at = 0
+            self.service._consume_book_event({"e": "bookTicker", "s": "1000PEPEUSDT", "st": 1,
+                "E": stamp, "T": stamp, "b": "100", "a": "100.01"})
             with self.assertRaises(ValueError):
                 await self.service._spread("1000PEPEUSDT")
+        self.service._request.assert_not_awaited()
 
-    async def test_spread_boundary_burst_uses_one_weight_five_shared_snapshot(self):
-        second = "BTCUSDT"
-        self.service._metadata[second] = meta(second)
-        calls = []
+    async def test_book_ticker_uses_one_public_websocket_stream(self):
+        self.service._running = True
+        events = [
+            {"data": {"e": "bookTicker", "s": "1000PEPEUSDT", "st": 1,
+                "E": self.now_ms - 100, "T": self.now_ms - 120, "b": "100", "a": "100.02"}},
+            {"data": {"e": "bookTicker", "s": "CMUSD", "st": 2,
+                "E": self.now_ms - 50, "T": self.now_ms - 60, "b": "1", "a": "2"}},
+        ]
+        drained, never = asyncio.Event(), asyncio.Event()
+        addresses = []
 
-        async def fake_book(path, params=None, weight=1):
-            calls.append((path, params, weight))
-            await asyncio.sleep(0)
-            return [
-                {"symbol": "1000PEPEUSDT", "bidPrice": "100", "askPrice": "100.01", "time": self.now_ms},
-                {"symbol": second, "bidPrice": "200", "askPrice": "200.04", "time": self.now_ms},
-                {"symbol": "IGNOREDUSDC", "bidPrice": "1", "askPrice": "2", "time": self.now_ms},
-            ]
+        class FakeSocket:
+            async def __aenter__(inner):
+                return inner
 
-        self.service._request = fake_book
-        spreads = await asyncio.gather(
-            self.service._spread("1000PEPEUSDT"), self.service._spread(second),
-            self.service._spread("1000PEPEUSDT"))
-        self.assertTrue(all(value > 0 for value in spreads))
-        self.assertEqual(calls, [("/fapi/v1/ticker/bookTicker", None, 5)])
-        self.assertEqual(self.service._book_snapshot_refreshes, 1)
-        self.assertEqual(self.service._book_snapshot_symbols, 2)
-        self.assertEqual(self.service._book_snapshot_invalid, 0)
+            async def __aexit__(inner, *args):
+                return False
 
-    async def test_slow_failed_book_snapshot_has_one_shared_retry_backoff(self):
-        calls = 0
+            async def receive(inner):
+                if events:
+                    return SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(events.pop(0)))
+                drained.set()
+                await never.wait()
 
-        async def failed_book(path, params=None, weight=1):
-            nonlocal calls
-            calls += 1
-            await asyncio.sleep(0.06)
-            raise ConnectionError("book snapshot unavailable")
+        def connect(url, **kwargs):
+            addresses.append(url)
+            return FakeSocket()
 
-        self.service._request = failed_book
-        with patch("monitor.collector.BOOK_SNAPSHOT_RETRY_SECONDS", 0.05):
-            results = await asyncio.gather(
-                *(self.service._spread("1000PEPEUSDT") for _ in range(12)),
-                return_exceptions=True)
-        self.assertEqual(calls, 1)
-        self.assertTrue(all(isinstance(result, Exception) for result in results))
+        self.service._session = SimpleNamespace(ws_connect=connect, close=AsyncMock())
+        task = asyncio.create_task(self.service._book_stream())
+        try:
+            await asyncio.wait_for(drained.wait(), 2)
+            self.assertIn("/public/stream?streams=!bookTicker", addresses[0])
+            self.assertGreater(await self.service._spread("1000PEPEUSDT"), 0)
+            self.assertNotIn("CMUSD", self.service._book_cache)
+            connection = next(row for row in self.service.status()["connections"]
+                              if row["name"] == "book-ticker")
+            self.assertEqual(connection["subscriptions"], 1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_midpoint_uncertainty_never_promotes_forming_rest_candle(self):
         self.service._running = True
@@ -1265,12 +1288,6 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         rows = await self.service._fetch_range("1000PEPEUSDT", "1m", start, boundary - 1)
         self.assertEqual(rows, [])
         self.assertEqual(self.store.counts()["candles"], 0)
-
-    def test_first_oi_cycle_marks_overdue_before_any_completed_cycle(self):
-        self.service._running = True
-        self.service._oi_cycle_started_at = self.now_ms - 61_000
-        self.assertIsNone(self.service._oi_cycle_seconds)
-        self.assertTrue(self.service.status()["scheduler"]["oi_cycle_overdue"])
 
     async def test_repeated_resume_preserves_active_tasks_pages_cursor_and_watermark(self):
         never = asyncio.Event()
@@ -1918,6 +1935,8 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.service._request = fake_request
         self.service._kline_stream = fake_stream
         self.service._market_stream = fake_stream
+        self.service._book_stream = lambda: fake_stream([], -1)
+        self.service._market_control_stream = lambda: fake_stream([], -2)
         await self.service._refresh_universe()
         expected = {"1000PEPEUSDT", "UNVERIFIEDUSDT", "STOCKUSDT", "BTCUSDT_260925", "ETHUSDT_261225"}
         self.assertEqual(set(self.service._metadata), expected)
@@ -1965,6 +1984,8 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.service._request = request
         self.service._kline_stream = stream
         self.service._market_stream = stream
+        self.service._book_stream = lambda: stream([], -1)
+        self.service._market_control_stream = lambda: stream([], -2)
         notified = []
         self.service.notification_sink = lambda kind, event: notified.append((kind, event["symbol"], event["event_type"]))
         await self.service._refresh_universe()

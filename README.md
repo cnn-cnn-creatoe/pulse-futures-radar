@@ -1,6 +1,6 @@
 # PULSE · 合约异动雷达
 
-**Windows 桌面发行版：v1.0.0。** 已包含 Supertrend / SMC / EMA 可选确认、强信号过滤、全量币种状态、新上架提醒、历史数据校验、回测页、Telegram 私有审批，以及纯净电脑的一键安装/启动/关闭/更新流程。操作说明见 [安装与更新说明](安装与更新说明.md) 和 [功能说明](backend/功能说明.md)，真实历史实验见 [回测说明与结果](backend/BACKTEST.md)。Telegram 为可选功能，默认关闭且信号推送默认不启用。
+**Windows 桌面发行版：v1.0.1。** 已包含 Supertrend / SMC / EMA 可选确认、强信号过滤、全量币种状态、新上架提醒、历史数据校验、回测页、Telegram 私有审批，以及纯净电脑的一键安装/启动/关闭/更新流程。操作说明见 [安装与更新说明](安装与更新说明.md) 和 [功能说明](backend/功能说明.md)，真实历史实验见 [回测说明与结果](backend/BACKTEST.md)。Telegram 为可选功能，默认关闭且信号推送默认不启用。
 
 发布包**不包含任何行情数据库、回测结果、Telegram Token 或个人设置**。每台电脑首次启动后会自动建立自己的 `backend/data`，页面显示逐币下载进度；随后已收盘的 5m/15m K 线持续写入本机。再次启动时保留已有数据，只检查并补齐停机期间的缺口。
 
@@ -31,7 +31,7 @@
 | 强信号收件箱 | 默认只显示通过所选指标、方向变化、量能、流动性、成本后空间与盈亏比的候选；原始异常保留 |
 | 分周期门槛 | 5m=2.5、15m=2；均为待验证起点，非最优参数 |
 | 指标 | Supertrend（ATR10、3倍）/ SMC 已确认结构 / EMA20/50，选一个或多个；全部或任一确认 |
-| 新上架 | 每分钟核对合约元数据，首次快照建基线，待上架与开放交易事件持久去重；只在看板提醒 |
+| 新上架 | `!contractInfo` WebSocket 实时发现合约变化，再用一次 `exchangeInfo` 核验完整 USDT/UM 元数据；首次快照建基线，事件持久去重 |
 | 回测 | 官方归档校验与 CSV/JSON 导入；次根开盘、双边费用滑点、结构止损优先、70/30时间切分与参数比较 |
 | 历史基准 | 默认剔除最高和最低各 2.5% 后求平均；当前两根不进入自己的基准 |
 | 活跃度 | 成交额 35 + 价格结构 20 + 主动成交 20 + OI 15 + 流动性 10 |
@@ -51,7 +51,7 @@
 
 离线测试覆盖计算规则、缺失数据、聚合、历史隔离、去重与恢复等行为。测试通过不等于已经验证全市场长期运行；首次历史预热和 OI 基准积累都需要时间，未就绪的币种与周期不会生成标准信号。
 
-首次基准下载与后续实时增量采集是不同流程。已存历史保留，重启只核对缓存并补当前窗口缺口；本轮分片、缺口恢复和持仓量采样调整，以及真实延迟观察见 [采集性能记录](backend/PERFORMANCE_NOTES.md)。
+首次基准下载与后续实时增量采集是不同流程。已存历史保留，重启只核对缓存并补当前窗口缺口；实时 K 线、成交额、标记价和盘口全部由 WebSocket 维护，逐合约 REST 持仓量轮询已关闭。分片与恢复记录见 [采集性能记录](backend/PERFORMANCE_NOTES.md)，当前接口审计见 [Binance API 审计](BINANCE_API_AUDIT.md)。
 
 后端只在进程运行、电脑醒着且网络可用时采集。关闭网页不等于停止后端；关闭进程、关机或休眠会中断采集。**当前未安装开机服务、系统守护、自动备份或 24 小时托管，不作持续在线承诺。** SQLite 和内存任务队列用于本机预览，尚未实现生产级持久化消息队列及崩溃期间信号的完整恢复。
 
@@ -59,7 +59,7 @@ Telegram 已实现私有白名单、管理员审批、每位用户独立筛选�
 
 ## Windows 一键安装与启动
 
-从 GitHub Release 下载 `PULSE-Windows-v1.0.0.zip`，完整解压到普通文件夹后双击 **`一键启动.bat`**。不要直接在压缩包预览窗口内运行。
+从 GitHub Release 下载 `PULSE-Windows-v1.0.1.zip`，完整解压到普通文件夹后双击 **`一键启动.bat`**。不要直接在压缩包预览窗口内运行。
 
 首次运行会检查 Python 3.11+、Node.js LTS（至少 22.13）、Git 和 GitHub CLI。缺少组件时优先使用 Windows `winget` 安装；若系统没有 `winget`，启动窗口会用中文说明需要手动安装什么。随后程序会自动创建 `.venv`、安装锁定的网页组件，在后台启动 8765/5173 两个本机服务，确认页面可用后打开浏览器。以后启动会复用已经安装的组件。
 
@@ -82,7 +82,7 @@ gh auth login
 发布者须在根目录 `release.json` 同步填写版本、私有仓库、稳定通道和资产名，再运行以下命令生成不含数据和密钥的 Release 资产与 SHA256 文件：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -Version v1.0.0
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -Version v1.0.1
 ```
 
 完整步骤、备份和故障处理见 [安装与更新说明](安装与更新说明.md)。
@@ -138,7 +138,7 @@ python -m unittest discover -s tests -v
 
 信号阈值和评分分档来自本项目的[计划书](<币安 U 本位全币种异常波动监测与 Telegram 实时推送系统计划书.md>)，不是币安官方交易策略。计划书把“去掉两端样本”称作 `winsorized_mean`；实现使用准确名称 `trimmed_mean`，仅兼容旧名称，实际算法始终是剔除两端后求平均。
 
-币安接口和字段依据官方 [USD-M REST 行情文档](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data)、[WebSocket 连接文档](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Connect)与[市场流文档](https://developers.binance.info/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/market)。
+币安接口和字段依据官方 [USD-M REST 行情文档](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data)、[WebSocket 连接文档](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Connect)、[市场流文档](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/market)与[公共盘口流文档](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public)。
 
 网页使用 [TradingView Lightweight Charts](https://github.com/tradingview/lightweight-charts) 绘制金融图表，使用 [shadcn/ui](https://github.com/shadcn-ui/ui) 的组件基础；卡片层级与信息布局参考 [Tremor 开源看板](https://github.com/tremorlabs/template-dashboard-oss)。第三方声明与许可链接见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 

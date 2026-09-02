@@ -24,7 +24,7 @@ type Props = {
   online: boolean;
 };
 
-const CURRENT_VERSION = 'v1.0.0';
+const CURRENT_VERSION = 'v1.0.1';
 
 async function responseMessage(response: Response, fallback: string) {
   try {

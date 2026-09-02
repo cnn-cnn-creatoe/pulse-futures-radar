@@ -3201,7 +3201,7 @@ export default function Home() {
               仅监测 · 不自动开仓 · 异常信号不构成交易建议
             </span>
             <span>
-              PULSE v1.0.0 <i />
+              PULSE v1.0.1 <i />
               {mode === 'demo' ? '演示数据已标识' : '只接收完整收盘 K 线'}
             </span>
           </footer>

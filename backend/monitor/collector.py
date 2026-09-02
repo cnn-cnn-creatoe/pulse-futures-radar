@@ -1,8 +1,10 @@
 """Read-only Binance USD-M market collector. No keys or order side effects.
 
-Official interface references (checked 2026-08-31):
+Official interface references (checked 2026-09-02):
 https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Connect
 https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data
+https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/market
+https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public
 """
 from __future__ import annotations
 
@@ -36,19 +38,21 @@ from .store import Store, contract_metadata_fields
 LOG = logging.getLogger(__name__)
 REST_BASE = "https://fapi.binance.com"
 WS_BASE = "wss://fstream.binance.com/market/stream"
+WS_PUBLIC_BASE = "wss://fstream.binance.com/public/stream"
 MINUTE = 60_000
 DAY = 86_400_000
 KLINE_SYMBOLS_PER_SHARD = 40
 GAP_WORKERS = 8
-OI_WORKERS = 8
-OI_CYCLE_SECONDS = 60
+REST_BUDGET_FRACTION = 0.45
+REST_HEADER_BACKOFF_FRACTION = 0.80
+WS_ROLLOVER_BASE_SECONDS = 22 * 3600 + 30 * 60
+WS_ROLLOVER_JITTER_SECONDS = 30 * 60
 CLOSED_QUEUE_CAPACITY = 20_000
 ANALYSIS_QUEUE_CAPACITY = 5_000
 SCAN_WORKERS = 2
 CANDIDATE_QUEUE_CAPACITY = 20_000
 CANDIDATE_WORKERS = 2
-BOOK_SNAPSHOT_TTL_SECONDS = 5
-BOOK_SNAPSHOT_RETRY_SECONDS = 1
+BOOK_TICKER_TTL_SECONDS = 15
 RECOVERY_CONFIRM_WAIT_MAX_SECONDS = 10
 RECOVERY_DATA_RETRY_SECONDS = 30
 INDICATOR_RULES_NOT_CONFIGURED = "indicator_rules_not_configured"
@@ -65,6 +69,15 @@ def completion_percentage(completed: int, total: int) -> float:
 
 class MarketAccessError(RuntimeError):
     """An official endpoint denies access; never try alternate endpoints to bypass it."""
+
+
+class BinanceRateLimitError(RuntimeError):
+    """A 429/418 response has activated the process-wide REST cooldown."""
+
+    def __init__(self, status: int, retry_after: float):
+        self.status = status
+        self.retry_after = retry_after
+        super().__init__(f"Binance HTTP {status}; REST 已全局暂停 {retry_after:.0f} 秒")
 
 
 def eligible_contract(meta: dict, futures_type: str | None = None) -> bool:
@@ -117,9 +130,12 @@ def retry_after_seconds(value: str | None, default: float = 60) -> float:
 
 class WeightBudget:
     """Conservative shared REST budget with spacing and exchange cooldown."""
-    def __init__(self, per_minute: int = 1800):
-        self.per_minute = per_minute
+    def __init__(self, exchange_limit: int = 2400):
+        self.exchange_limit = max(60, exchange_limit)
+        self.per_minute = max(60, int(self.exchange_limit * REST_BUDGET_FRACTION))
         self.used_header = 0
+        self.used_headers: dict[str, int] = {}
+        self.used_headers_observed_at = 0.0
         self.cooldown_until = 0.0
         self._next = 0.0
         self._lock = asyncio.Lock()
@@ -139,6 +155,38 @@ class WeightBudget:
                 await asyncio.sleep(wait)
             self._history.append((now, weight))
             self._next = now + 60 * weight / self.per_minute
+
+    def configure(self, exchange_limit: int) -> None:
+        """Keep enough headroom for shared-IP traffic outside this process."""
+        self.exchange_limit = max(60, int(exchange_limit))
+        self.per_minute = max(60, int(self.exchange_limit * REST_BUDGET_FRACTION))
+
+    def observe_used(self, used: int) -> None:
+        """Back off before the exchange turns a nearly full minute into a ban."""
+        self.used_header = max(0, int(used))
+        if self.used_header >= int(self.exchange_limit * REST_HEADER_BACKOFF_FRACTION):
+            self.cooldown_until = max(self.cooldown_until, time.monotonic() + 65)
+
+    def observe_headers(self, headers: Any) -> dict[str, int]:
+        """Record every Binance request-weight interval header, not only 1M."""
+        observed: dict[str, int] = {}
+        for raw_key, raw_value in headers.items():
+            key = str(raw_key).upper()
+            if not key.startswith("X-MBX-USED-WEIGHT-"):
+                continue
+            try:
+                observed[key] = max(0, int(raw_value))
+            except (TypeError, ValueError):
+                continue
+        if observed:
+            self.used_headers.update(observed)
+            self.used_headers_observed_at = time.monotonic()
+            if "X-MBX-USED-WEIGHT-1M" in observed:
+                self.observe_used(observed["X-MBX-USED-WEIGHT-1M"])
+        return observed
+
+    def defer(self, seconds: float) -> None:
+        self.cooldown_until = max(self.cooldown_until, time.monotonic() + max(1, seconds))
 
 
 class MonitorService:
@@ -198,17 +246,16 @@ class MonitorService:
         self._rank_refreshed_at = 0.0
         self._rank_groups: dict[str, dict] = {}
         self._book_cache: dict[str, tuple[float, float, int]] = {}
-        self._book_snapshot_lock = asyncio.Lock()
-        self._book_snapshot_at = 0.0
-        self._book_snapshot_attempt_at = 0.0
-        self._book_snapshot_observed_at = 0
-        self._book_snapshot_refreshes = 0
-        self._book_snapshot_symbols = 0
-        self._book_snapshot_invalid = 0
+        self._book_ticker_events = 0
+        self._book_ticker_invalid = 0
         self._connections: dict[str, dict] = {}
         self._connection_delays: dict[str, deque[int]] = {}
         self._errors: deque[dict] = deque(maxlen=16)
         self._budget = WeightBudget()
+        # Serialize REST I/O. Once one response is 429/418, no other request can
+        # already be in flight and every queued caller sees the shared cooldown.
+        self._rest_request_lock = asyncio.Lock()
+        self._rest_usage_history: deque[dict] = deque(maxlen=120)
         self._last_event = 0
         self._last_closed = 0
         self._last_refresh = 0
@@ -216,11 +263,6 @@ class MonitorService:
         self._exclusion_reasons: dict[str, int] = {}
         self._unknown_underlying = 0
         self._history_jobs_done = 0
-        self._oi_last_cycle = 0
-        self._oi_cycle_seconds: float | None = None
-        self._oi_cycle_started_at = 0
-        self._oi_inflight = 0
-        self._oi_cycle_samples = 0
         self._received_closed = 0
         self._analysis_dropped = 0
         self._analysis_expired = 0
@@ -419,13 +461,9 @@ class MonitorService:
         self._rank_groups.clear()
         self._mark.clear()
         self._book_cache.clear()
-        self._book_snapshot_lock = asyncio.Lock()
-        self._book_snapshot_at = 0.0
-        self._book_snapshot_attempt_at = 0.0
-        self._book_snapshot_observed_at = 0
-        self._book_snapshot_refreshes = 0
-        self._book_snapshot_symbols = 0
-        self._book_snapshot_invalid = 0
+        self._book_ticker_events = 0
+        self._book_ticker_invalid = 0
+        self._rest_usage_history.clear()
         self._last_event = self._last_closed = self._last_refresh = 0
         self._received_closed = self._signal_count = self._history_jobs_done = 0
         self._analysis_dropped = 0
@@ -438,11 +476,6 @@ class MonitorService:
         self._qualified_count = self._listing_count = 0
         self._excluded = self._unknown_underlying = 0
         self._exclusion_reasons.clear()
-        self._oi_last_cycle = 0
-        self._oi_cycle_seconds = None
-        self._oi_cycle_started_at = 0
-        self._oi_inflight = 0
-        self._oi_cycle_samples = 0
         self._running = True
         self._state = "connecting"
         self._message = "正在连接币安公开行情，确认可监测的合约范围"
@@ -506,41 +539,48 @@ class MonitorService:
     async def _request(self, path: str, params: dict | None = None, weight: int = 1) -> Any:
         if not self._session:
             raise RuntimeError("Market service is not started")
-        for attempt in range(5):
-            await self._budget.acquire(weight)
-            try:
-                sent_at, began = int(time.time() * 1000), time.monotonic()
-                async with self._session.get(REST_BASE + path, params=params) as response:
-                    used = response.headers.get("X-MBX-USED-WEIGHT-1M")
-                    if used:
-                        self._budget.used_header = int(used)
-                    if response.status in (403, 451):
-                        raise MarketAccessError(f"币安公开行情访问被拒绝（HTTP {response.status}）；请在可合法访问币安的网络或服务器运行")
-                    if response.status in (418, 429):
-                        seconds = retry_after_seconds(response.headers.get("Retry-After"))
-                        self._budget.cooldown_until = time.monotonic() + seconds
-                        self._error("REST限速", f"HTTP {response.status}，按 Retry-After 等待 {seconds:.0f} 秒")
-                        continue
-                    if response.status >= 500:
-                        raise aiohttp.ClientResponseError(response.request_info, response.history,
-                                                          status=response.status, message="upstream unavailable")
-                    response.raise_for_status()
-                    data = await response.json()
-                    if isinstance(data, dict) and isinstance(data.get("code"), int) and data["code"] < 0:
-                        raise ValueError(f"Binance {data['code']}: {data.get('msg', '')}")
-                    if path == "/fapi/v1/time" and "serverTime" in data:
-                        elapsed = round((time.monotonic() - began) * 1000)
-                        self._clock_sample = {"began": began, "server_time": int(data["serverTime"]),
-                                              "midpoint": sent_at + elapsed / 2, "rtt_ms": elapsed}
-                    return data
-            except MarketAccessError:
-                raise
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if isinstance(exc, aiohttp.ClientResponseError) and 400 <= exc.status < 500:
+        async with self._rest_request_lock:
+            for attempt in range(5):
+                await self._budget.acquire(weight)
+                try:
+                    sent_at, began = int(time.time() * 1000), time.monotonic()
+                    async with self._session.get(REST_BASE + path, params=params) as response:
+                        observed = self._budget.observe_headers(response.headers)
+                        if observed:
+                            self._rest_usage_history.append({
+                                "time": self.now(), "path": path, "status": response.status,
+                                "headers": observed,
+                            })
+                        if response.status in (403, 451):
+                            raise MarketAccessError(f"币安公开行情访问被拒绝（HTTP {response.status}）；请在可合法访问币安的网络或服务器运行")
+                        if response.status in (418, 429):
+                            seconds = retry_after_seconds(response.headers.get("Retry-After"))
+                            self._budget.defer(seconds)
+                            self._error("REST限速", f"HTTP {response.status}，所有REST按 Retry-After 暂停 {seconds:.0f} 秒")
+                            # Never retry the triggering request here. Callers
+                            # fail closed and may be queued again only after the
+                            # one process-wide cooldown has elapsed.
+                            raise BinanceRateLimitError(response.status, seconds)
+                        if response.status >= 500:
+                            raise aiohttp.ClientResponseError(response.request_info, response.history,
+                                                              status=response.status, message="upstream unavailable")
+                        response.raise_for_status()
+                        data = await response.json()
+                        if isinstance(data, dict) and isinstance(data.get("code"), int) and data["code"] < 0:
+                            raise ValueError(f"Binance {data['code']}: {data.get('msg', '')}")
+                        if path == "/fapi/v1/time" and "serverTime" in data:
+                            elapsed = round((time.monotonic() - began) * 1000)
+                            self._clock_sample = {"began": began, "server_time": int(data["serverTime"]),
+                                                  "midpoint": sent_at + elapsed / 2, "rtt_ms": elapsed}
+                        return data
+                except (MarketAccessError, BinanceRateLimitError):
                     raise
-                if attempt == 4:
-                    raise
-                await asyncio.sleep(min(30, 2**attempt) + random.random())
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    if isinstance(exc, aiohttp.ClientResponseError) and 400 <= exc.status < 500:
+                        raise
+                    if attempt == 4:
+                        raise
+                    await asyncio.sleep(min(30, 2**attempt) + random.random())
         raise RuntimeError("币安接口持续限速，请等待冷却后重试")
 
     async def _run(self) -> None:
@@ -562,12 +602,16 @@ class MonitorService:
                         self._spawn(self._candidate_worker(), f"signals-{worker}")
                     for worker in range(GAP_WORKERS):
                         self._spawn(self._recover_worker(), f"gap-recovery-{worker}")
-                    self._spawn(self._oi_poller(), "open-interest")
                     self._spawn(self._health_loop(), "market-health")
                     launched = True
                 self._state = "warming"
                 self._message = "公开行情已连接，正在分批加载 5m / 15m 历史基准"
-                await self._sleep_or_refresh(60)
+                # Contract changes are announced by !contractInfo. REST scope
+                # and clock refreshes happen only at startup, on that event, or
+                # after the control WebSocket reconnects and may have missed an
+                # event. There is no steady one-minute REST polling loop.
+                await self._refresh_requested.wait()
+                self._refresh_requested.clear()
             except asyncio.CancelledError:
                 raise
             except MarketAccessError as exc:
@@ -585,7 +629,7 @@ class MonitorService:
         info = await self._request("/fapi/v1/exchangeInfo")
         for rule in info.get("rateLimits", []):
             if rule.get("rateLimitType") == "REQUEST_WEIGHT" and rule.get("interval") == "MINUTE":
-                self._budget.per_minute = max(60, int(rule["limit"] * 0.75))
+                self._budget.configure(rule["limit"])
         old = set(self._metadata)
         all_symbols = [{**m, "futuresType": m.get("futuresType") or info.get("futuresType")}
                        for m in info.get("symbols", [])]
@@ -613,13 +657,11 @@ class MonitorService:
                           "market_type": "UM", "tick_size": self._tick(m["symbol"])}
                          for m in selected]
         self._last_refresh = self.now()
-        # Public ticker provides quote-volume order for a useful first warmup.
-        if not self._ticker:
-            try:
-                tickers = await self._request("/fapi/v1/ticker/24hr", weight=40)
-                self._consume_tickers(tickers, rest=True)
-            except Exception as exc:
-                self._error("初始成交额排名", exc)
+        # Do not block startup on the weight-40 all-symbol REST ticker. The
+        # already-required websocket mini-ticker streams populate the same
+        # ranking continuously, while alphabetical fallback keeps the initial
+        # warmup deterministic. This also lets live streams recover even when
+        # Binance REST is cooling down after a prior 429/418 response.
         ordered = sorted(self._metadata, key=lambda s: (
             s not in {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"},
             -float(self._ticker.get(s, {}).get("quote_volume", 0)), s))
@@ -644,6 +686,12 @@ class MonitorService:
             self._shards = [task for i, shard in enumerate(shards) for task in (
                 self._spawn(self._kline_stream(shard, i), f"kline-shard-{i}"),
                 self._spawn(self._market_stream(shard, i), f"market-shard-{i}"))]
+            # These two all-market streams are each one subscription. Payloads
+            # are filtered by st=1 and the verified metadata universe.
+            self._shards.extend((
+                self._spawn(self._book_stream(), "book-ticker"),
+                self._spawn(self._market_control_stream(), "market-control"),
+            ))
         for symbol in old - set(self._metadata):
             self._symbol_heartbeat.pop(symbol, None)
             self._reconnect_fence.discard(symbol)
@@ -660,6 +708,12 @@ class MonitorService:
             -float(self._ticker.get(symbol, {}).get("quote_volume", 0)), symbol))
         count = math.ceil(len(ordered) / KLINE_SYMBOLS_PER_SHARD)
         return [ordered[index::count] for index in range(count)] if count else []
+
+    @staticmethod
+    def _ws_rollover_seconds(name: str) -> int:
+        """Stagger proactive reconnects safely before Binance's 24h cutoff."""
+        stable = sum((index + 1) * ord(char) for index, char in enumerate(name))
+        return WS_ROLLOVER_BASE_SECONDS + stable % WS_ROLLOVER_JITTER_SECONDS
 
     def _tick(self, symbol: str) -> float:
         for item in self._metadata.get(symbol, {}).get("filters", []):
@@ -877,6 +931,8 @@ class MonitorService:
     async def _kline_stream(self, symbols: list[str], index: int) -> None:
         name = f"kline-{index}"
         streams = "/".join(f"{s.lower()}@kline_1m" for s in symbols)
+        if len(symbols) > 1024:
+            raise ValueError(f"{name} subscriptions exceed Binance limit: {len(symbols)}")
         attempt = 0
         connected_before = False
         while self._running:
@@ -893,7 +949,7 @@ class MonitorService:
                     if connected_before:
                         self._fence_reconnected_symbols(symbols)
                     connected_before = True
-                    while self._running and time.monotonic() - began < 23 * 3600:
+                    while self._running and time.monotonic() - began < self._ws_rollover_seconds(name):
                         msg = await asyncio.wait_for(ws.receive(), timeout=90)
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             payload = json.loads(msg.data)
@@ -923,6 +979,9 @@ class MonitorService:
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                             raise ConnectionError(f"WebSocket disconnected: type={msg.type.name}, code={ws.close_code}, "
                                                   f"data={str(msg.data)[:120]}, reason={str(msg.extra)[:120]}, exception={str(ws.exception())[:120]}")
+                if self._running:
+                    self._connections[name]["state"] = "rolling"
+                    await asyncio.sleep(0.2 + random.random())
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -975,12 +1034,13 @@ class MonitorService:
     async def _market_stream(self, symbols: list[str], index: int) -> None:
         name = f"market-{index}"
         subscribed = set(symbols)
-        streams = "/".join(stream for symbol in symbols for stream in (
-            f"{symbol.lower()}@miniTicker", f"{symbol.lower()}@markPrice"))
+        streams = "/".join(f"{symbol.lower()}@markPrice" for symbol in symbols)
+        if len(symbols) > 1024:
+            raise ValueError(f"{name} subscriptions exceed Binance limit: {len(symbols)}")
         attempt = 0
         while self._running:
             self._connections[name] = {**self._connections.get(name, {}), "state": "connecting",
-                "subscriptions": len(symbols) * 2, "symbols_count": len(symbols),
+                "subscriptions": len(symbols), "symbols_count": len(symbols),
                 "last_message": None, "last_event_time": None}
             try:
                 assert self._session
@@ -989,8 +1049,8 @@ class MonitorService:
                                                      heartbeat=60, receive_timeout=90, max_msg_size=2**22) as ws:
                     began = time.monotonic()
                     self._connections[name].update(state="connected", connected_at=self.now())
-                    self._download_event("ws_connected", message=f"{name} 已连接，订阅 {len(symbols)} 个币种的成交额/标记价格")
-                    while self._running and time.monotonic() - began < 23 * 3600:
+                    self._download_event("ws_connected", message=f"{name} 已连接，订阅 {len(symbols)} 个币种的标记价格")
+                    while self._running and time.monotonic() - began < self._ws_rollover_seconds(name):
                         msg = await asyncio.wait_for(ws.receive(), timeout=90)
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             payload = json.loads(msg.data)
@@ -998,7 +1058,7 @@ class MonitorService:
                             received = self.now()
                             self._connections[name]["last_message"] = received
                             if (not isinstance(event, dict) or event.get("s") not in subscribed
-                                    or event.get("e") not in {"24hrMiniTicker", "markPriceUpdate"} or not event.get("E")):
+                                    or event.get("e") != "markPriceUpdate" or not event.get("E")):
                                 continue
                             event_time = int(event["E"])
                             self._record_connection_event(name, event_time, received)
@@ -1009,12 +1069,153 @@ class MonitorService:
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                             raise ConnectionError(f"{name} WebSocket disconnected: type={msg.type.name}, code={ws.close_code}, "
                                 f"data={str(msg.data)[:120]}, reason={str(msg.extra)[:120]}, exception={str(ws.exception())[:120]}")
+                if self._running:
+                    self._connections[name]["state"] = "rolling"
+                    await asyncio.sleep(0.2 + random.random())
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 prior = self._connections.get(name, {})
                 self._connections[name] = {**prior, "state": "reconnecting",
                     "last_error": str(exc)[:300], "last_error_at": self.now(), "reconnects": prior.get("reconnects", 0) + 1}
+                self._download_event("ws_error", message=f"{name}: {str(exc)[:250]}")
+                self._error(name, exc)
+                attempt += 1
+                await asyncio.sleep(min(60, 2 ** min(attempt, 6)) + random.random())
+
+    async def _book_stream(self) -> None:
+        """Maintain best bid/ask from the one-stream all-market public feed."""
+        name = "book-ticker"
+        attempt = 0
+        while self._running:
+            self._connections[name] = {**self._connections.get(name, {}), "state": "connecting",
+                "subscriptions": 1, "symbols_count": len(self._metadata),
+                "last_message": None, "last_event_time": None}
+            try:
+                assert self._session
+                async with self._session.ws_connect(WS_PUBLIC_BASE + "?streams=!bookTicker", autoping=True,
+                                                     heartbeat=60, receive_timeout=90, max_msg_size=2**22) as ws:
+                    began = time.monotonic()
+                    self._connections[name].update(state="connected", connected_at=self.now())
+                    self._download_event("ws_connected", message="book-ticker 已连接，全市场最优买卖价由WebSocket更新")
+                    while self._running and time.monotonic() - began < self._ws_rollover_seconds(name):
+                        msg = await asyncio.wait_for(ws.receive(), timeout=90)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            payload = json.loads(msg.data)
+                            event = payload.get("data", payload)
+                            received = self.now()
+                            self._connections[name]["last_message"] = received
+                            if not isinstance(event, dict) or event.get("e") != "bookTicker" or not event.get("E"):
+                                continue
+                            event_time = int(event["E"])
+                            self._record_connection_event(name, event_time, received)
+                            if received - event_time > 90_000 or event_time - received > 10_000:
+                                raise TimeoutError("WebSocket 盘口时间已过期或超前")
+                            attempt = 0
+                            self._consume_book_event(event)
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                            raise ConnectionError(f"{name} WebSocket disconnected: type={msg.type.name}, code={ws.close_code}, "
+                                f"data={str(msg.data)[:120]}, reason={str(msg.extra)[:120]}, exception={str(ws.exception())[:120]}")
+                if self._running:
+                    self._connections[name]["state"] = "rolling"
+                    await asyncio.sleep(0.2 + random.random())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                prior = self._connections.get(name, {})
+                self._connections[name] = {**prior, "state": "reconnecting", "last_error": str(exc)[:300],
+                    "last_error_at": self.now(), "reconnects": prior.get("reconnects", 0) + 1}
+                self._download_event("ws_error", message=f"{name}: {str(exc)[:250]}")
+                self._error(name, exc)
+                attempt += 1
+                await asyncio.sleep(min(60, 2 ** min(attempt, 6)) + random.random())
+
+    def _consume_book_event(self, event: dict) -> None:
+        symbol = event.get("s")
+        if (event.get("e") != "bookTicker" or symbol not in self._metadata
+                or event.get("st") not in (1, "1")):
+            return
+        event_time = event.get("E")
+        source_time = event.get("T", event_time)
+        try:
+            bid, ask = float(event["b"]), float(event["a"])
+            source_time = int(source_time)
+            if (not isinstance(event_time, int) or isinstance(event_time, bool)
+                    or not self._timestamp_fresh(event_time) or not self._timestamp_fresh(source_time)
+                    or not (math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask)):
+                raise ValueError("invalid book ticker")
+            spread = (ask - bid) / ((ask + bid) / 2) * 10_000
+        except (KeyError, TypeError, ValueError, OverflowError):
+            self._book_ticker_invalid += 1
+            return
+        self._book_cache[symbol] = (time.monotonic(), spread, source_time)
+        self._book_ticker_events += 1
+
+    async def _market_control_stream(self) -> None:
+        """Receive all mini-tickers and contract changes without REST polling."""
+        name = "market-control"
+        streams = "!miniTicker@arr/!contractInfo"
+        attempt = 0
+        connected_before = False
+        while self._running:
+            self._connections[name] = {**self._connections.get(name, {}), "state": "connecting",
+                "subscriptions": 2, "symbols_count": len(self._metadata),
+                "last_message": None, "last_event_time": None}
+            try:
+                assert self._session
+                async with self._session.ws_connect(WS_BASE + "?streams=" + streams, autoping=True,
+                                                     heartbeat=60, receive_timeout=90, max_msg_size=2**23) as ws:
+                    began = time.monotonic()
+                    self._connections[name].update(state="connected", connected_at=self.now())
+                    self._download_event("ws_connected", message="market-control 已连接，成交额与合约变更由WebSocket更新")
+                    if connected_before:
+                        # A disconnected control feed may have missed a listing
+                        # or settlement event. One metadata REST refresh is the
+                        # bounded recovery path.
+                        self._refresh_requested.set()
+                    connected_before = True
+                    while self._running and time.monotonic() - began < self._ws_rollover_seconds(name):
+                        msg = await asyncio.wait_for(ws.receive(), timeout=90)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            payload = json.loads(msg.data)
+                            event = payload.get("data", payload)
+                            received = self.now()
+                            self._connections[name]["last_message"] = received
+                            if isinstance(event, list):
+                                valid = [row for row in event if (isinstance(row, dict) and row.get("E")
+                                                                 and row.get("st") in (1, "1"))]
+                                if not valid:
+                                    continue
+                                event_time = max(int(row["E"]) for row in valid)
+                                self._record_connection_event(name, event_time, received)
+                                if received - event_time > 90_000 or event_time - received > 10_000:
+                                    raise TimeoutError("WebSocket 全市场行情时间已过期或超前")
+                                self._consume_tickers(valid)
+                                attempt = 0
+                                continue
+                            if not isinstance(event, dict) or event.get("e") != "contractInfo" or not event.get("E"):
+                                continue
+                            event_time = int(event["E"])
+                            self._record_connection_event(name, event_time, received)
+                            if received - event_time > 90_000 or event_time - received > 10_000:
+                                raise TimeoutError("WebSocket 合约信息时间已过期或超前")
+                            if event.get("st") in (1, "1"):
+                                current = self._metadata.get(event.get("s"))
+                                if current is None or event.get("cs") != current.get("status"):
+                                    self._refresh_requested.set()
+                            attempt = 0
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                            raise ConnectionError(f"{name} WebSocket disconnected: type={msg.type.name}, code={ws.close_code}, "
+                                f"data={str(msg.data)[:120]}, reason={str(msg.extra)[:120]}, exception={str(ws.exception())[:120]}")
+                if self._running:
+                    self._connections[name]["state"] = "rolling"
+                    await asyncio.sleep(0.2 + random.random())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                prior = self._connections.get(name, {})
+                self._connections[name] = {**prior, "state": "reconnecting", "last_error": str(exc)[:300],
+                    "last_error_at": self.now(), "reconnects": prior.get("reconnects", 0) + 1}
                 self._download_event("ws_error", message=f"{name}: {str(exc)[:250]}")
                 self._error(name, exc)
                 attempt += 1
@@ -1533,86 +1734,13 @@ class MonitorService:
                 self._candidate_queue.task_done()
 
     async def _spread(self, symbol: str) -> float:
-        """Return a fresh spread from one shared official all-symbol snapshot.
-
-        Binance charges weight 2 for one symbol and 5 when ``symbol`` is
-        omitted.  A boundary burst can contain hundreds of candidates, so a
-        singleflight bulk read is both faster and materially cheaper while the
-        same per-row timestamp and quote validation remains fail-closed.
-        """
+        """Return a fresh WebSocket spread; never fall back to live REST."""
         now = time.monotonic()
         cached = self._book_cache.get(symbol)
-        if (cached and now - cached[0] < BOOK_SNAPSHOT_TTL_SECONDS
+        if (cached and now - cached[0] < BOOK_TICKER_TTL_SECONDS
                 and self._timestamp_fresh(cached[2])):
             return cached[1]
-        # A recent successful snapshot that omitted/invalidated this symbol is
-        # authoritative for its TTL; do not turn one bad row into N bulk calls.
-        if now - self._book_snapshot_at < BOOK_SNAPSHOT_TTL_SECONDS:
-            raise ValueError("共享买卖报价中缺少有效合约")
-        await self._refresh_book_snapshot()
-        cached = self._book_cache.get(symbol)
-        if (not cached or time.monotonic() - cached[0] >= BOOK_SNAPSHOT_TTL_SECONDS
-                or not self._timestamp_fresh(cached[2])):
-            raise ValueError("共享买卖报价中缺少有效合约")
-        return cached[1]
-
-    async def _refresh_book_snapshot(self) -> None:
-        async with self._book_snapshot_lock:
-            now = time.monotonic()
-            if now - self._book_snapshot_at < BOOK_SNAPSHOT_TTL_SECONDS:
-                return
-            if (self._book_snapshot_attempt_at
-                    and now - self._book_snapshot_attempt_at < BOOK_SNAPSHOT_RETRY_SECONDS):
-                raise RuntimeError("共享买卖报价刚刚刷新失败，短暂退避")
-            self._book_snapshot_attempt_at = now
-            # Official request weight is 5 without a symbol (2 per symbol).
-            try:
-                books = await self._request("/fapi/v1/ticker/bookTicker", weight=5)
-                if not isinstance(books, list):
-                    raise ValueError("共享买卖报价响应格式无效")
-            except asyncio.CancelledError:
-                self._book_snapshot_attempt_at = time.monotonic()
-                raise
-            except Exception:
-                # Mark failure completion, not request start.  Otherwise a slow
-                # failed request can outlive the retry window and every waiter
-                # behind the lock immediately launches another bulk retry.
-                self._book_snapshot_attempt_at = time.monotonic()
-                raise
-            received_at = self.now()
-            cached_at = time.monotonic()
-            snapshot: dict[str, tuple[float, float, int]] = {}
-            invalid = 0
-            for book in books:
-                try:
-                    symbol = book.get("symbol")
-                    if symbol not in self._metadata:
-                        continue
-                    bid, ask = float(book["bidPrice"]), float(book["askPrice"])
-                    if not (math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
-                        raise ValueError("买卖报价无效")
-                    raw_time = book.get("time")
-                    if raw_time is not None:
-                        if isinstance(raw_time, bool):
-                            raise ValueError("买卖报价时间无效")
-                        source_time = int(raw_time)
-                        if not self._timestamp_fresh(source_time):
-                            raise ValueError("买卖报价时间已过期或超前")
-                    else:
-                        # The prior single-symbol path allowed an omitted time;
-                        # receipt time remains an explicit, fresh upper bound.
-                        source_time = received_at
-                    spread = (ask - bid) / ((ask + bid) / 2) * 10_000
-                    snapshot[symbol] = (cached_at, spread, source_time)
-                except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
-                    invalid += 1
-            # Publish atomically only after the whole response was validated.
-            self._book_cache = snapshot
-            self._book_snapshot_at = cached_at
-            self._book_snapshot_observed_at = received_at
-            self._book_snapshot_refreshes += 1
-            self._book_snapshot_symbols = len(snapshot)
-            self._book_snapshot_invalid = invalid
+        raise ValueError("WebSocket最优买卖价缺失或过期；不使用REST补查")
 
     def _fence_reconnected_symbols(self, symbols: list[str]) -> None:
         """Block signals until each reconnected symbol proves continuity.
@@ -1781,76 +1909,6 @@ class MonitorService:
                     self._schedule_gap(symbol, self._gap_start[symbol])
                 elif symbol not in self._metadata:
                     self._gap_start.pop(symbol, None)
-
-    async def _sample_oi(self, symbol: str) -> None:
-        self._oi_inflight += 1
-        try:
-            # All workers still pass through the one shared REST weight budget.
-            data = await self._request("/fapi/v1/openInterest", {"symbol": symbol})
-            if not eligible_contract(self._metadata.get(symbol, {})):
-                return
-            sampled_at = self.now()  # Observation time, never its scheduled slot.
-            source_time = data.get("time")
-            if (not isinstance(source_time, int) or isinstance(source_time, bool) or source_time <= 0
-                    or not self._timestamp_fresh(source_time, 75_000)):
-                raise ValueError("持仓量源时间缺失、过期或超前；不保存为当前样本")
-            quantity = float(data["openInterest"])
-            if not math.isfinite(quantity) or quantity <= 0:
-                return
-            mark = self._mark.get(symbol)
-            price = mark[0] if mark and self._timestamp_fresh(mark[1]) else None
-            await asyncio.to_thread(self.store.save_oi, {
-                "symbol": symbol, "timestamp": sampled_at,
-                "open_interest_quantity": quantity, "mark_price": price,
-                "source_time": source_time,
-            })
-            self._oi_cycle_samples += 1
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self._error(f"持仓量 {symbol}", exc)
-        finally:
-            self._oi_inflight -= 1
-
-    async def _oi_cycle(self, symbols: list[str], began: float) -> None:
-        """At most eight requests in flight; spread first dispatches over a minute."""
-        jobs: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
-        for index, symbol in enumerate(symbols):
-            jobs.put_nowait((index, symbol))
-
-        async def worker() -> None:
-            while self._running:
-                try:
-                    index, symbol = jobs.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                try:
-                    due = began + index * OI_CYCLE_SECONDS / max(1, len(symbols))
-                    await asyncio.sleep(max(0, due - time.monotonic()))
-                    if self._running and symbol in self._metadata:
-                        await self._sample_oi(symbol)
-                finally:
-                    jobs.task_done()
-
-        workers = [asyncio.create_task(worker(), name=f"oi-sample-{index}")
-                   for index in range(min(OI_WORKERS, len(symbols)))]
-        try:
-            await asyncio.gather(*workers)
-        finally:
-            for task in workers:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
-
-    async def _oi_poller(self) -> None:
-        while self._running:
-            began = time.monotonic()
-            self._oi_cycle_started_at = self.now()
-            self._oi_cycle_samples = 0
-            await self._oi_cycle(list(self._metadata), began)
-            self._oi_last_cycle = self.now()
-            self._oi_cycle_seconds = round(time.monotonic() - began, 1)
-            await asyncio.sleep(max(1, OI_CYCLE_SECONDS - (time.monotonic() - began)))
 
     def oi_enrichment(self, symbol: str, timeframe: str, close_time: int) -> dict:
         """Only compare matched two-bar durations; missing boundaries stay unscored.
@@ -2136,7 +2194,6 @@ class MonitorService:
         snapshot, recent_listings = self.store.status_snapshot(5)
         now_monotonic = time.monotonic()
         recent_weight = sum(w for at, w in self._budget._history if at >= now_monotonic - 60)
-        oi_elapsed = max(0, (self.now() - self._oi_cycle_started_at) / 1000) if self._oi_cycle_started_at and self._running else 0
         completed_pairs = sum(bool(self._download_jobs.get(pair, {}).get("download_complete")) and pair not in self._warm_pending for pair in states)
         scheduler = {"warmup_pending_pairs": len(self._warm_pending), "warmup_queue": self._warm_queue.qsize(),
                      "closed_queue": self._closed_queue.qsize(), "analysis_queue": self._analysis_queue.qsize(),
@@ -2148,29 +2205,27 @@ class MonitorService:
                      "analysis_expired": self._analysis_expired,
                      "analysis_expired_conditions": dict(self._analysis_expired_conditions),
                      "candidate_dropped": self._candidate_dropped,
-                     "book_snapshot_refreshes": self._book_snapshot_refreshes,
-                     "book_snapshot_symbols": self._book_snapshot_symbols,
-                     "book_snapshot_invalid_rows": self._book_snapshot_invalid,
-                     "book_snapshot_observed_at": self._book_snapshot_observed_at or None,
-                     "book_snapshot_age_ms": (round((now_monotonic - self._book_snapshot_at) * 1000)
-                                              if self._book_snapshot_at else None),
+                     "book_ticker_source": "websocket",
+                     "book_ticker_events": self._book_ticker_events,
+                     "book_ticker_symbols": len(self._book_cache),
+                     "book_ticker_invalid_events": self._book_ticker_invalid,
                      "rest_weight_scheduled_last_minute": recent_weight,
                      "rest_budget_utilization_pct": round(recent_weight / self._budget.per_minute * 100, 1),
-                     "oi_target_requests_per_minute": len(symbols),
-                      "oi_cycle_overdue": oi_elapsed > 60 or (self._oi_cycle_seconds or 0) > 120,
-                      "oi_current_cycle_seconds": round(oi_elapsed, 1), "history_workers": 6,
+                     "steady_state_open_interest_rest": False,
+                     "history_workers": 6,
                       "analysis_workers": SCAN_WORKERS, "candidate_workers": CANDIDATE_WORKERS,
                       "gap_workers": GAP_WORKERS, "gap_queue": self._gap_queue.qsize(),
-                      "oi_workers": OI_WORKERS, "oi_inflight": self._oi_inflight,
-                      "oi_cycle_samples": self._oi_cycle_samples,
                       "kline_symbols_per_shard": KLINE_SYMBOLS_PER_SHARD,
                       "market_symbols_per_shard": KLINE_SYMBOLS_PER_SHARD,
-                      "market_streams_per_symbol": 2,
+                      "market_streams_per_symbol": 1,
+                     "max_streams_per_connection": max(
+                         [c.get("subscriptions", 0) for c in self._connections.values()] or [0]),
                      "pressure": "high" if (self._closed_queue.qsize() > 2000 or self._analysis_queue.qsize() > 2000
-                         or self._candidate_queue.qsize() > 2000
-                         or max(oi_elapsed, self._oi_cycle_seconds or 0) > 120) else "warming" if self._warm_pending else "normal"}
+                         or self._candidate_queue.qsize() > 2000) else "warming" if self._warm_pending else "normal"}
         connections = [self._connection_snapshot(name, info) for name, info in self._connections.copy().items()]
         fresh_connections = sum(c["content_fresh"] for c in connections if c["name"].startswith("kline-"))
+        metadata_stream_fresh = any(
+            c["name"] == "market-control" and c["content_fresh"] for c in connections)
         state, message = self._state, self._message
         if state not in {"blocked", "error", "stopped", "connecting"}:
             if fresh_connections == 0:
@@ -2191,7 +2246,10 @@ class MonitorService:
                 "live_ready_symbols": sum(all(states[(s, tf)]["state"] == "ready" for tf in MONITOR_TIMEFRAMES) for s in live_symbols),
                 "live_ready_pairs": sum(live_ready_by_tf.values()), "timeframe_live_ready": live_ready_by_tf,
                 "timeframe_counts": timeframe_counts, "scope_verified": self._last_refresh > 0,
-                "metadata_stale": not self._last_refresh or self.now() - self._last_refresh >= 180_000,
+                # exchangeInfo is intentionally not polled.  A fresh control
+                # stream is the continuing proof that listing/status changes
+                # are supervised after the initial REST snapshot.
+                "metadata_stale": not self._last_refresh or not metadata_stream_fresh,
                 "warming_symbols": len(symbols) - ready_symbols, "timeframe_ready": ready_by_tf,
                 "timeframe_total": len(states), "ready_pairs": sum(ready_by_tf.values()),
                 "warming_pairs": warming, "insufficient_pairs": insufficient, "error_pairs": errors,
@@ -2208,6 +2266,10 @@ class MonitorService:
                 "connections": connections,
                 "liquidity_rank_status": self._liquidity_rank_status(),
                 "errors": list(self._errors), "rest_weight": self._budget.used_header,
+                "rest_weight_headers": dict(self._budget.used_headers),
+                "rest_weight_headers_observed_at": (
+                    self._rest_usage_history[-1]["time"] if self._rest_usage_history else None),
+                "rest_weight_observations": list(self._rest_usage_history)[-20:],
                 "rest_budget_per_minute": self._budget.per_minute,
                 "rest_cooldown_seconds": max(0, round(self._budget.cooldown_until - time.monotonic())),
                 "gap_symbols": len(self._gap_pending), "closed_queue": self._closed_queue.qsize(),
@@ -2222,8 +2284,9 @@ class MonitorService:
                 "qualified_signals_this_run": self._qualified_count,
                 "new_listing_events_this_run": self._listing_count, "recent_listings": recent_listings,
                 "listing_count": snapshot["listed_events"], "upcoming_listing_count": snapshot["upcoming_events"],
-                "listing_poll_seconds": 60, "exclusion_reasons": self._exclusion_reasons,
+                "listing_poll_seconds": None, "listing_detection": "websocket_contract_info",
+                "exclusion_reasons": self._exclusion_reasons,
                 "unknown_underlying_contracts": self._unknown_underlying, "scheduler": scheduler,
-                "oi_last_cycle": self._oi_last_cycle or None, "oi_cycle_seconds": self._oi_cycle_seconds,
-                "oi_note": "8并发均匀调度，目标每60秒一轮；实际周期受网络/共享额度影响，至少30个同周期有效历史变化样本后才计分",
+                "oi_last_cycle": None, "oi_cycle_seconds": None,
+                "oi_note": "已关闭逐合约REST持仓量轮询；旧本地OI仅作历史兼容，实时信号缺失OI时该项不计分",
                 "scope": "仅币安官方UM且USDT计价的全部合约类型与资产类别（含TradFi和交割）；TRADING实时采集，PENDING_TRADING单列待上市"}
