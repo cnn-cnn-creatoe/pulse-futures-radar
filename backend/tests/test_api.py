@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 from urllib.parse import quote
 
 from fastapi.testclient import TestClient
@@ -136,9 +136,12 @@ class ApiTests(unittest.TestCase):
         }
         with patch.object(self.api.update_service, 'status', return_value=status) as check:
             response = self.client.get('/api/update/status')
+            forced = self.client.get('/api/update/status?force=true')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), status)
-        check.assert_called_once_with()
+        self.assertEqual(forced.status_code, 200)
+        self.assertEqual(forced.json(), status)
+        self.assertEqual(check.call_args_list, [call(force=False), call(force=True)])
 
         with patch.object(self.api.update_service, 'schedule_update',
                           return_value={'scheduled': True, 'message': '更新已安排'}) as schedule:

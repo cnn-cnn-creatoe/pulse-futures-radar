@@ -196,9 +196,9 @@ download_inventory_cache = install_download_routes(app,store,service,require_das
 
 
 @app.get('/api/update/status')
-def update_status():
+def update_status(force: bool = False):
     """Check the configured private GitHub release with a short bounded cache."""
-    return update_service.status()
+    return update_service.status(force=force)
 
 
 @app.post('/api/update/apply')

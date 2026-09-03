@@ -207,7 +207,7 @@ try {
 
     if ($ownedBackend -and $ownedDashboard) {
         Write-Step '监测服务和看板已经在运行。'
-        if (-not $NoBrowser) { Start-Process 'http://127.0.0.1:5173/' }
+        if (-not $NoBrowser) { Start-Process 'http://localhost:5173/' }
         exit 0
     }
     if ($ownedBackend -or $ownedDashboard) {
@@ -285,7 +285,7 @@ try {
     }
 
     Write-Step '启动完成。首次使用时，页面会显示历史数据下载进度；完成后会自动持续保存实时数据。'
-    if (-not $NoBrowser) { Start-Process 'http://127.0.0.1:5173/' }
+    if (-not $NoBrowser) { Start-Process 'http://localhost:5173/' }
     exit 0
 }
 catch {

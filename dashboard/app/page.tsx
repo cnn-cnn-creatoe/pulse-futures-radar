@@ -64,7 +64,7 @@ import {
 } from '@/components/ui/popover';
 import { DownloadPanel } from './download-panel';
 import { TelegramSettingsPanel } from './telegram-settings';
-import { UpdatePanel } from './update-panel';
+import { UpdateControl } from './update-panel';
 import {
   CATEGORIES,
   categoryLabel,
@@ -1150,7 +1150,7 @@ function CandleChart({
 }
 export default function Home() {
   const [view, setView] = useState('overview');
-  const [mode, setMode] = useState<'demo' | 'live'>('demo');
+  const [mode, setMode] = useState<'demo' | 'live'>('live');
   const [demo, setDemo] = useState<Signal[]>([]);
   const [live, setLive] = useState<Signal[]>([]);
   const [status, setStatus] = useState<Status>({});
@@ -1215,10 +1215,20 @@ export default function Home() {
   }, []);
   useEffect(() => {
     const host = window.location.hostname;
+    if (host === '127.0.0.1') {
+      const cleanOrigin = new URL(window.location.href);
+      cleanOrigin.hostname = 'localhost';
+      window.location.replace(cleanOrigin.toString());
+      return;
+    }
     if (new URLSearchParams(window.location.search).get('view') === 'downloads')
       setView('universe');
-    if (host === '127.0.0.1' || host === 'localhost') {
-      setApi('http://127.0.0.1:8765');
+    if (host === 'localhost') {
+      // Use Vite's same-origin /api proxy instead of a cross-origin browser
+      // request to port 8765. Normal and incognito Chrome profiles then use
+      // the same connection path and cached CORS/extension rules cannot make
+      // the dashboard report a false offline state.
+      setApi(window.location.origin);
       setMode('live');
     }
     try {
@@ -1754,12 +1764,6 @@ export default function Home() {
     setDateFilter('all');
     updateStrategySelection([]);
     updateStrategyMode('all');
-  }
-  function switchMode(next: 'demo' | 'live') {
-    setMode(next);
-    setSelectedId('');
-    resetFilters();
-    setPaused(false);
   }
   function exportCsv() {
     if (!filtered.length) return;
@@ -2328,22 +2332,7 @@ export default function Home() {
                   保存全部规则
                 </Button>
               )}
-              <div className="mode-switch" aria-label="数据模式">
-                <button
-                  aria-pressed={mode === 'demo'}
-                  className={mode === 'demo' ? 'active' : ''}
-                  onClick={() => switchMode('demo')}
-                >
-                  演示预览
-                </button>
-                <button
-                  aria-pressed={mode === 'live'}
-                  className={mode === 'live' ? 'active' : ''}
-                  onClick={() => switchMode('live')}
-                >
-                  实时监测
-                </button>
-              </div>
+              <UpdateControl api={api} online={apiOnline} />
               <Button
                 variant="outline"
                 size="icon"
@@ -3098,7 +3087,6 @@ export default function Home() {
                   );
                 })}
               </div>
-              <UpdatePanel api={api} online={apiOnline} />
               <TelegramSettingsPanel api={api} online={apiOnline} />
               <section className="panel status-details">
                 <div className="panel-heading">
@@ -3201,7 +3189,7 @@ export default function Home() {
               仅监测 · 不自动开仓 · 异常信号不构成交易建议
             </span>
             <span>
-              PULSE v1.0.1 <i />
+              PULSE v1.0.2 <i />
               {mode === 'demo' ? '演示数据已标识' : '只接收完整收盘 K 线'}
             </span>
           </footer>

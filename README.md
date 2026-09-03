@@ -1,6 +1,6 @@
 # PULSE · 合约异动雷达
 
-**Windows 桌面发行版：v1.0.1。** 已包含 Supertrend / SMC / EMA 可选确认、强信号过滤、全量币种状态、新上架提醒、历史数据校验、回测页、Telegram 私有审批，以及纯净电脑的一键安装/启动/关闭/更新流程。操作说明见 [安装与更新说明](安装与更新说明.md) 和 [功能说明](backend/功能说明.md)，真实历史实验见 [回测说明与结果](backend/BACKTEST.md)。Telegram 为可选功能，默认关闭且信号推送默认不启用。
+**Windows 桌面发行版：v1.0.2。** 已包含 Supertrend / SMC / EMA 可选确认、强信号过滤、全量币种状态、新上架提醒、历史数据校验、回测页、Telegram 私有审批，以及纯净电脑的一键安装/启动/关闭/更新流程。操作说明见 [安装与更新说明](安装与更新说明.md) 和 [功能说明](backend/功能说明.md)，真实历史实验见 [回测说明与结果](backend/BACKTEST.md)。Telegram 为可选功能，默认关闭且信号推送默认不启用。
 
 发布包**不包含任何行情数据库、回测结果、Telegram Token 或个人设置**。每台电脑首次启动后会自动建立自己的 `backend/data`，页面显示逐币下载进度；随后已收盘的 5m/15m K 线持续写入本机。再次启动时保留已有数据，只检查并补齐停机期间的缺口。
 
@@ -12,7 +12,7 @@
 
 本机看板启动方法见下方“Windows 一键安装与启动”。`打开看板.url` 只负责打开页面；真正开始采集请双击 `一键启动.bat`，退出请双击 `一键关闭.bat`。
 
-- 网页看板：[http://127.0.0.1:5173](http://127.0.0.1:5173)
+- 网页看板：[http://localhost:5173](http://localhost:5173)
 - 后端状态：[http://127.0.0.1:8765/api/status](http://127.0.0.1:8765/api/status)
 - 接口说明：[http://127.0.0.1:8765/docs](http://127.0.0.1:8765/docs)
 
@@ -59,7 +59,7 @@ Telegram 已实现私有白名单、管理员审批、每位用户独立筛选�
 
 ## Windows 一键安装与启动
 
-从 GitHub Release 下载 `PULSE-Windows-v1.0.1.zip`，完整解压到普通文件夹后双击 **`一键启动.bat`**。不要直接在压缩包预览窗口内运行。
+从 GitHub Release 下载 `PULSE-Windows-v1.0.2.zip`，完整解压到普通文件夹后双击 **`一键启动.bat`**。不要直接在压缩包预览窗口内运行。
 
 首次运行会检查 Python 3.11+、Node.js LTS（至少 22.13）、Git 和 GitHub CLI。缺少组件时优先使用 Windows `winget` 安装；若系统没有 `winget`，启动窗口会用中文说明需要手动安装什么。随后程序会自动创建 `.venv`、安装锁定的网页组件，在后台启动 8765/5173 两个本机服务，确认页面可用后打开浏览器。以后启动会复用已经安装的组件。
 
@@ -82,7 +82,7 @@ gh auth login
 发布者须在根目录 `release.json` 同步填写版本、私有仓库、稳定通道和资产名，再运行以下命令生成不含数据和密钥的 Release 资产与 SHA256 文件：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -Version v1.0.1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -Version v1.0.2
 ```
 
 完整步骤、备份和故障处理见 [安装与更新说明](安装与更新说明.md)。

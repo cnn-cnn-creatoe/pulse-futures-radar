@@ -1,5 +1,5 @@
 {
-  "version": "v1.0.1",
+  "version": "v1.0.2",
   "files": [
     ".gitattributes",
     ".gitignore",
@@ -172,6 +172,7 @@
     "scripts/update-worker.ps1",
     "scripts/update.ps1",
     "THIRD_PARTY_NOTICES.md",
-    "VERSION"
+    "VERSION",
+    "RELEASE_NOTES_v1.0.2.md"
   ]
 }
