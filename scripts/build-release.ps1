@@ -8,14 +8,14 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\')
-if (-not $Version) { $Version = (Get-Content -LiteralPath (Join-Path $projectRoot 'VERSION') -Raw).Trim() }
+if (-not $Version) { $Version = (Get-Content -LiteralPath (Join-Path $projectRoot 'VERSION') -Raw -Encoding UTF8).Trim() }
 if ($Version -notmatch '^v\d+\.\d+\.\d+$') { throw '版本号必须使用 v1.2.3 格式。' }
-if ((Get-Content -LiteralPath (Join-Path $projectRoot 'VERSION') -Raw).Trim() -ne $Version) {
+if ((Get-Content -LiteralPath (Join-Path $projectRoot 'VERSION') -Raw -Encoding UTF8).Trim() -ne $Version) {
     throw '参数版本号与 VERSION 文件不一致。'
 }
 $releaseConfigPath = Join-Path $projectRoot 'release.json'
 if (-not (Test-Path -LiteralPath $releaseConfigPath)) { throw '缺少 release.json。' }
-try { $releaseConfig = Get-Content -LiteralPath $releaseConfigPath -Raw | ConvertFrom-Json }
+try { $releaseConfig = Get-Content -LiteralPath $releaseConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json }
 catch { throw 'release.json 无法读取。' }
 if ([string]$releaseConfig.version -ne $Version -or
     [string]$releaseConfig.release_channel -ne 'stable') {

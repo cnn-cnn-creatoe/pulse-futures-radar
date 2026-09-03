@@ -40,7 +40,7 @@ function Get-Sha256([string]$Path) {
 
 function Resolve-Repository {
     if (-not (Test-Path -LiteralPath $releaseFile)) { throw '缺少 release.json，无法连接版本仓库。' }
-    try { $config = Get-Content -LiteralPath $releaseFile -Raw | ConvertFrom-Json }
+    try { $config = Get-Content -LiteralPath $releaseFile -Raw -Encoding UTF8 | ConvertFrom-Json }
     catch { throw 'release.json 无法读取，已停止更新。' }
     if ([string]$config.release_channel -ne 'stable') { throw 'release.json 的发布通道无效，已停止更新。' }
     $candidate = ([string]$config.repository).Trim().TrimEnd('/')
@@ -53,10 +53,10 @@ function Resolve-Repository {
 function Get-ReleaseState {
     if (-not (Test-Path -LiteralPath $versionFile)) { throw '缺少 VERSION 文件，无法判断当前版本。' }
     if (-not (Test-Path -LiteralPath $releaseFile)) { throw '缺少 release.json，无法连接版本仓库。' }
-    $currentTag = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+    $currentTag = (Get-Content -LiteralPath $versionFile -Raw -Encoding UTF8).Trim()
     $currentVersion = Convert-SemVer $currentTag
     if (-not $currentVersion) { throw ('VERSION 内容“{0}”不是 v主版本.次版本.修订号 格式。' -f $currentTag) }
-    $releaseConfig = Get-Content -LiteralPath $releaseFile -Raw | ConvertFrom-Json
+    $releaseConfig = Get-Content -LiteralPath $releaseFile -Raw -Encoding UTF8 | ConvertFrom-Json
     if ([string]$releaseConfig.version -ne $currentTag) { throw 'release.json 与 VERSION 的当前版本不一致。' }
     if ([string]$releaseConfig.asset_name -ne ('PULSE-Windows-{0}.zip' -f $currentTag)) {
         throw 'release.json 的当前版本资产名不一致。'
@@ -107,7 +107,7 @@ function Find-PayloadRoot([string]$ExtractRoot, [string]$ExpectedTag) {
         if ($children.Count -ne 1) { throw '下载包结构无效：找不到唯一的 VERSION 文件。' }
         $candidate = $children[0].FullName
     }
-    $payloadTag = (Get-Content -LiteralPath (Join-Path $candidate 'VERSION') -Raw).Trim()
+    $payloadTag = (Get-Content -LiteralPath (Join-Path $candidate 'VERSION') -Raw -Encoding UTF8).Trim()
     if ($payloadTag -ne $ExpectedTag) { throw ('下载包版本为 {0}，预期为 {1}，已停止更新。' -f $payloadTag, $ExpectedTag) }
     foreach ($required in @('scripts\start.ps1', 'scripts\stop.ps1', 'scripts\update.ps1', 'scripts\update-worker.ps1', 'scripts\update-cleanup.ps1', 'release-manifest.json', '一键启动.bat')) {
         if (-not (Test-Path -LiteralPath (Join-Path $candidate $required))) { throw ('下载包缺少 {0}，已停止更新。' -f $required) }
@@ -117,7 +117,7 @@ function Find-PayloadRoot([string]$ExtractRoot, [string]$ExpectedTag) {
 
 function Assert-ReleaseManifest([string]$PayloadRoot, [string]$Version) {
     $manifestFile = Join-Path $PayloadRoot 'release-manifest.json'
-    try { $manifest = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json }
+    try { $manifest = Get-Content -LiteralPath $manifestFile -Raw -Encoding UTF8 | ConvertFrom-Json }
     catch { throw '发布清单无法读取，已停止更新。' }
     if ([string]$manifest.version -ne $Version -or -not $manifest.files) {
         throw '发布清单的版本或文件列表无效，已停止更新。'
@@ -178,7 +178,7 @@ try {
         throw ('Release 必须同时提供 {0} 和 {1}；缺少任一文件都不会安装。' -f $assetName, $checksumName)
     }
 
-    $checksumText = (Get-Content -LiteralPath $checksumPath -Raw).Trim()
+    $checksumText = (Get-Content -LiteralPath $checksumPath -Raw -Encoding UTF8).Trim()
     $checksumMatch = [regex]::Match($checksumText, '^(?i)([0-9a-f]{64})(?:\s+\*?(.+))?$')
     if (-not $checksumMatch.Success) { throw 'Release 的 SHA256 文件格式无效。' }
     if ($checksumMatch.Groups[2].Success -and $checksumMatch.Groups[2].Value.Trim() -ne $assetName) {

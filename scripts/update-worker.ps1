@@ -54,7 +54,11 @@ function Assert-ChildPath([string]$Candidate, [string]$Parent, [string]$Label) {
 function Invoke-ScriptProcess([string]$ScriptPath, [string[]]$ExtraArguments) {
     $powerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
     $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ScriptPath)) + $ExtraArguments
-    $process = Start-Process -FilePath $powerShell -ArgumentList $arguments -WorkingDirectory $root -WindowStyle Hidden -Wait -PassThru
+    # Windows PowerShell 5.1 Start-Process -Wait may wait for the entire child
+    # tree. start.ps1 intentionally leaves the backend/dashboard descendants
+    # running, so wait only for the direct PowerShell process here.
+    $process = Start-Process -FilePath $powerShell -ArgumentList $arguments -WorkingDirectory $root -WindowStyle Hidden -PassThru
+    $process.WaitForExit()
     return $process.ExitCode
 }
 
@@ -81,7 +85,7 @@ try {
     if (-not $temp.StartsWith(($systemTemp + '\'), [StringComparison]::OrdinalIgnoreCase)) {
         throw '安全检查失败：临时更新目录不在系统临时目录中。'
     }
-    $payloadVersion = (Get-Content -LiteralPath (Join-Path $payload 'VERSION') -Raw).Trim()
+    $payloadVersion = (Get-Content -LiteralPath (Join-Path $payload 'VERSION') -Raw -Encoding UTF8).Trim()
     if ($payloadVersion -ne $ExpectedTag) { throw '应用更新前版本校验失败。' }
 
     $stage = '关闭旧版本服务'
@@ -99,9 +103,9 @@ try {
     $oldManifest = $null
     $oldManifestFile = Join-Path $root 'release-manifest.json'
     if (Test-Path -LiteralPath $oldManifestFile) {
-        try { $oldManifest = Get-Content -LiteralPath $oldManifestFile -Raw | ConvertFrom-Json } catch { $oldManifest = $null }
+        try { $oldManifest = Get-Content -LiteralPath $oldManifestFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $oldManifest = $null }
     }
-    $newManifest = Get-Content -LiteralPath (Join-Path $payload 'release-manifest.json') -Raw | ConvertFrom-Json
+    $newManifest = Get-Content -LiteralPath (Join-Path $payload 'release-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 
     $stage = '替换程序文件'
     Write-UpdateStatus 'installing' '正在覆盖程序文件；历史数据和个人设置保持不变。'
@@ -151,7 +155,7 @@ try {
 
     $stage = '启动新版本服务'
     Write-UpdateStatus 'restarting' '程序文件已更新，正在重新启动。'
-    $startCode = Invoke-ScriptProcess (Join-Path $root 'scripts\start.ps1') @()
+    $startCode = Invoke-ScriptProcess (Join-Path $root 'scripts\start.ps1') @('-NoBrowser')
     if ($startCode -ne 0) { throw '新版本已经安装，但自动重启失败。请双击“一键启动.bat”并查看 .runtime 日志。' }
 
     Write-UpdateStatus 'complete' ('已更新到 {0} 并重新启动。' -f $ExpectedTag)
@@ -194,7 +198,7 @@ catch {
     }
 
     if ($rollbackSucceeded) {
-        try { [void](Invoke-ScriptProcess (Join-Path $root 'scripts\start.ps1') @()) } catch { }
+        try { [void](Invoke-ScriptProcess (Join-Path $root 'scripts\start.ps1') @('-NoBrowser')) } catch { }
     }
     else {
         $message = '{0}；旧版本恢复未完成，为避免运行混合文件，程序没有自动重启。' -f $message
