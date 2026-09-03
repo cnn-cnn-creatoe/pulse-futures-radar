@@ -17,6 +17,7 @@ $runtime = Join-Path $root '.runtime'
 $statusFile = Join-Path $runtime 'update-status.json'
 $logFile = Join-Path $runtime 'update.log'
 $lockFile = Join-Path $runtime 'update.lock'
+$stage = '初始化更新器'
 
 function Write-UpdateLog([string]$Message) {
     ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message) | Add-Content -LiteralPath $logFile -Encoding UTF8
@@ -72,6 +73,7 @@ New-Item -ItemType Directory -Path $runtime -Force | Out-Null
 Start-Sleep -Seconds 3
 
 try {
+    $stage = '检查更新目录'
     Assert-ChildPath $payload $temp '更新内容'
     if (Test-Path -LiteralPath (Join-Path $root '.git')) {
         throw '检测到 Git 开发工作区，临时更新器拒绝覆盖。'
@@ -82,11 +84,13 @@ try {
     $payloadVersion = (Get-Content -LiteralPath (Join-Path $payload 'VERSION') -Raw).Trim()
     if ($payloadVersion -ne $ExpectedTag) { throw '应用更新前版本校验失败。' }
 
+    $stage = '关闭旧版本服务'
     Write-UpdateStatus 'stopping' '正在安全关闭本项目服务。'
     Write-UpdateLog ('开始安装 {0}。' -f $ExpectedTag)
     $stopCode = Invoke-ScriptProcess (Join-Path $root 'scripts\stop.ps1') @('-Quiet')
     if ($stopCode -ne 0) { throw '无法安全关闭现有服务，因此没有覆盖程序文件。' }
 
+    $stage = '准备备份目录'
     $backupRoot = Join-Path $temp 'backup'
     New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
     $newFiles = New-Object System.Collections.Generic.List[string]
@@ -99,12 +103,14 @@ try {
     }
     $newManifest = Get-Content -LiteralPath (Join-Path $payload 'release-manifest.json') -Raw | ConvertFrom-Json
 
+    $stage = '替换程序文件'
     Write-UpdateStatus 'installing' '正在覆盖程序文件；历史数据和个人设置保持不变。'
     foreach ($file in $files) {
         $relative = $file.FullName.Substring($payloadPrefixLength)
         if (Test-Preserved $relative) { continue }
         $destination = Join-Path $root $relative
-        Assert-ChildPath $destination $root '目标文件'
+        try { Assert-ChildPath $destination $root '目标文件' }
+        catch { throw ('无法解析目标文件“{0}”：{1}' -f $relative, $_.Exception.Message) }
         $destinationDirectory = Split-Path -Parent $destination
         if (-not (Test-Path -LiteralPath $destinationDirectory)) {
             New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
@@ -122,6 +128,7 @@ try {
         Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
     }
 
+    $stage = '清理旧版本文件'
     if ($oldManifest -and $oldManifest.files) {
         $newSet = @{}
         foreach ($newRelative in @($newManifest.files)) {
@@ -142,6 +149,7 @@ try {
         }
     }
 
+    $stage = '启动新版本服务'
     Write-UpdateStatus 'restarting' '程序文件已更新，正在重新启动。'
     $startCode = Invoke-ScriptProcess (Join-Path $root 'scripts\start.ps1') @()
     if ($startCode -ne 0) { throw '新版本已经安装，但自动重启失败。请双击“一键启动.bat”并查看 .runtime 日志。' }
@@ -153,8 +161,9 @@ try {
     exit 0
 }
 catch {
-    $message = $_.Exception.Message
+    $message = '{0}失败：{1}' -f $stage, $_.Exception.Message
     Write-UpdateLog ('更新失败：{0}' -f $message)
+    if ($_.ScriptStackTrace) { Write-UpdateLog ('位置：{0}' -f $_.ScriptStackTrace) }
 
     $rollbackSucceeded = $true
     try {

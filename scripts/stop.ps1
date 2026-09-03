@@ -83,6 +83,39 @@ function Stop-OwnedRunner([string]$Name, [string]$PidFile, [string]$RunnerFile) 
     return $true
 }
 
+function Stop-VerifiedPortOwner([int]$Port, [string]$Name) {
+    $connections = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+    if ($connections.Count -eq 0) { return $true }
+
+    foreach ($ownerId in @($connections | Select-Object -ExpandProperty OwningProcess -Unique)) {
+        $process = Get-CimInstance Win32_Process -Filter ('ProcessId={0}' -f $ownerId) -ErrorAction SilentlyContinue
+        if (-not $process) { continue }
+        $commandLine = [string]$process.CommandLine
+        if ($commandLine.IndexOf($projectRoot, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            Write-StopMessage ('安全检查未通过：端口 {0} 的进程不属于本项目，因此没有结束它。' -f $Port) Red
+            return $false
+        }
+
+        $descendants = @(Get-DescendantIds ([int]$ownerId))
+        [array]::Reverse($descendants)
+        foreach ($childId in $descendants) {
+            Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue
+        }
+        Stop-Process -Id ([int]$ownerId) -Force -ErrorAction SilentlyContinue
+    }
+
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline -and (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)) {
+        Start-Sleep -Milliseconds 250
+    }
+    if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
+        Write-StopMessage ('{0}的端口 {1} 未能释放。' -f $Name, $Port) Red
+        return $false
+    }
+    Write-StopMessage ('{0}残留进程已清理。' -f $Name) Green
+    return $true
+}
+
 try {
     if (-not (Test-Path -LiteralPath $runtimeRoot)) {
         Write-StopMessage '没有发现运行中的本项目服务。'
@@ -91,7 +124,9 @@ try {
 
     $dashboardOk = Stop-OwnedRunner '网页看板' (Join-Path $runtimeRoot 'dashboard.pid') (Join-Path $PSScriptRoot 'run-dashboard.ps1')
     $backendOk = Stop-OwnedRunner '实时行情服务' (Join-Path $runtimeRoot 'backend.pid') (Join-Path $PSScriptRoot 'run-backend.ps1')
-    if (-not $dashboardOk -or -not $backendOk) { exit 1 }
+    $dashboardPortOk = Stop-VerifiedPortOwner 5173 '网页看板'
+    $backendPortOk = Stop-VerifiedPortOwner 8765 '实时行情服务'
+    if (-not $dashboardOk -or -not $backendOk -or -not $dashboardPortOk -or -not $backendPortOk) { exit 1 }
     Write-StopMessage 'PULSE 已全部关闭。' Green
     exit 0
 }
