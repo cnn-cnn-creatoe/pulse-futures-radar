@@ -32,7 +32,7 @@ type Props = {
   online: boolean;
 };
 
-const CURRENT_VERSION = 'v3.0.1';
+const CURRENT_VERSION = 'v3.0.2';
 const UPDATE_POLL_MS = 30 * 60 * 1000;
 
 async function responseMessage(response: Response, fallback: string) {
@@ -50,7 +50,7 @@ export function UpdateControl({ api, online }: Props) {
     latest_version: null,
     update_available: false,
     can_update: false,
-    message: '点击后检查私密 GitHub 仓库中的稳定版本。',
+    message: '点击后检查公开 GitHub 仓库中的稳定版本。',
   });
   const [open, setOpen] = useState(false);
   const [checking, setChecking] = useState(false);

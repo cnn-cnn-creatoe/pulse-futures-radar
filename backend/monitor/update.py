@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 import json
 import os
 import re
@@ -19,7 +20,7 @@ import time
 from typing import Callable
 
 
-CURRENT_VERSION = "v3.0.1"
+CURRENT_VERSION = "v3.0.2"
 DEFAULT_GITHUB_REPOSITORY = "cnn-cnn-creatoe/pulse-futures-radar"
 STATUS_CACHE_SECONDS = 60.0
 GH_TIMEOUT_SECONDS = 12.0
@@ -116,47 +117,21 @@ class UpdateService:
         return ReleaseConfig(version, repository, channel)
 
     def _query_latest(self, config: ReleaseConfig) -> tuple[str, str]:
-        executable = shutil.which("gh")
-        if executable is None:
-            raise UpdateError("未检测到 GitHub CLI，请先安装 gh 并登录有私密仓库权限的账号。")
-        command = [
-            executable,
-            "release",
-            "view",
-            "--repo",
-            config.github_repository,
-            "--json",
-            "tagName,url",
-        ]
-        environment = os.environ.copy()
-        environment["GH_PROMPT_DISABLED"] = "1"
-        environment["NO_COLOR"] = "1"
+        request = Request(
+            f"https://api.github.com/repos/{config.github_repository}/releases/latest",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "PULSE-Updater"},
+        )
         try:
-            completed = subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.timeout_seconds,
-                check=False,
-                shell=False,
-                env=environment,
-            )
-        except subprocess.TimeoutExpired:
-            raise UpdateError("检查 GitHub 版本超时，请稍后重试。") from None
-        except OSError:
-            raise UpdateError("GitHub CLI 无法启动，请检查 gh 是否已正确安装。") from None
-        if completed.returncode != 0:
-            # stderr may include a private URL or authentication diagnostics.
-            # Return a fixed message and never forward captured command output.
-            raise UpdateError("无法读取私密 GitHub 仓库，请确认 gh 已登录且账号有仓库权限。")
-        try:
-            payload = json.loads(completed.stdout)
-            latest = payload["tagName"]
-        except (json.JSONDecodeError, TypeError, KeyError):
-            raise UpdateError("GitHub 返回的版本信息无法识别，请稍后重试。") from None
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                raw = response.read(1048577)
+            if len(raw) > 1048576:
+                raise ValueError("oversized response")
+            payload = json.loads(raw)
+            if payload.get("draft") or payload.get("prerelease"):
+                raise ValueError("not stable")
+            latest = payload["tag_name"]
+        except (OSError, ValueError, TypeError, KeyError):
+            raise UpdateError("无法读取 GitHub 公开版本，请检查网络或稍后重试；无需登录。") from None
         if not isinstance(latest, str) or _version_parts(latest) is None:
             raise UpdateError("GitHub 最新 Release 的版本号不符合 v主版本.次版本.修订版 格式。")
         # Construct this from validated components instead of trusting a URL

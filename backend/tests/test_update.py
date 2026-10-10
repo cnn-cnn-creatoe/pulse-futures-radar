@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import subprocess
+from io import BytesIO
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -47,7 +48,7 @@ class UpdateServiceTests(unittest.TestCase):
         )
         with (
             patch("monitor.update.shutil.which", return_value=r"C:\Program Files\GitHub CLI\gh.exe"),
-            patch("monitor.update.subprocess.run", return_value=completed) as run,
+            patch("monitor.update.urlopen", return_value=BytesIO(completed.stdout.replace("tagName", "tag_name").encode())) as run,
         ):
             first = service.status()
             second = service.status()
@@ -64,12 +65,9 @@ class UpdateServiceTests(unittest.TestCase):
         )
         self.assertNotIn("secret", json.dumps(first))
         call = run.call_args
-        self.assertEqual(call.args[0][1:4], ["release", "view", "--repo"])
-        self.assertEqual(call.args[0][4], "cnn-cnn-creatoe/pulse-futures-radar")
+        self.assertEqual(call.args[0].full_url, "https://api.github.com/repos/cnn-cnn-creatoe/pulse-futures-radar/releases/latest")
+        self.assertIsNone(call.args[0].get_header("Authorization"))
         self.assertEqual(call.kwargs["timeout"], 2.5)
-        self.assertFalse(call.kwargs["shell"])
-        self.assertIs(call.kwargs["stdin"], subprocess.DEVNULL)
-        self.assertEqual(call.kwargs["env"]["GH_PROMPT_DISABLED"], "1")
 
     def test_cli_failure_returns_fixed_chinese_reason_without_stderr(self):
         service = UpdateService(self.root)
@@ -78,13 +76,13 @@ class UpdateServiceTests(unittest.TestCase):
         )
         with (
             patch("monitor.update.shutil.which", return_value="gh"),
-            patch("monitor.update.subprocess.run", return_value=completed),
+            patch("monitor.update.urlopen", side_effect=OSError("token=ghp_do_not_echo private-url")),
         ):
             result = service.status()
         serialized = json.dumps(result, ensure_ascii=False)
         self.assertFalse(result["can_update"])
         self.assertIsNone(result["latest_version"])
-        self.assertIn("请确认 gh 已登录", result["message"])
+        self.assertIn("无需登录", result["message"])
         self.assertNotIn("ghp_do_not_echo", serialized)
         self.assertNotIn("private-url", serialized)
 
@@ -98,7 +96,7 @@ class UpdateServiceTests(unittest.TestCase):
             with self.subTest(repository=repository):
                 self.write_config(repository=repository)
                 service = UpdateService(self.root)
-                with patch("monitor.update.subprocess.run") as run:
+                with patch("monitor.update.urlopen") as run:
                     result = service.status()
                 self.assertFalse(result["can_update"])
                 self.assertIn("字段不合法", result["message"])
@@ -115,7 +113,7 @@ class UpdateServiceTests(unittest.TestCase):
 
         with (
             patch("monitor.update.shutil.which", side_effect=executable),
-            patch("monitor.update.subprocess.run", return_value=latest),
+            patch("monitor.update.urlopen", side_effect=lambda *a,**k: BytesIO(latest.stdout.replace("tagName", "tag_name").encode())),
             patch("monitor.update.subprocess.Popen") as popen,
         ):
             popen.return_value.poll.return_value = None
@@ -140,7 +138,7 @@ class UpdateServiceTests(unittest.TestCase):
         )
         with (
             patch("monitor.update.shutil.which", side_effect=lambda name: name),
-            patch("monitor.update.subprocess.run", return_value=latest),
+            patch("monitor.update.urlopen", side_effect=lambda *a,**k: BytesIO(latest.stdout.replace("tagName", "tag_name").encode())),
             patch("monitor.update.subprocess.Popen") as popen,
         ):
             popen.return_value.poll.return_value = 1
@@ -155,7 +153,7 @@ class UpdateServiceTests(unittest.TestCase):
         )
         with (
             patch("monitor.update.shutil.which", return_value="gh.exe"),
-            patch("monitor.update.subprocess.run", return_value=latest),
+            patch("monitor.update.urlopen", side_effect=lambda *a,**k: BytesIO(latest.stdout.replace("tagName", "tag_name").encode())),
             patch("monitor.update.subprocess.Popen") as popen,
         ):
             with self.assertRaisesRegex(UpdateError, "没有可安装"):

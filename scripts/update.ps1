@@ -62,28 +62,13 @@ function Get-ReleaseState {
         throw 'release.json 的当前版本资产名不一致。'
     }
 
-    $gh = Get-Command gh.exe -ErrorAction SilentlyContinue
-    if (-not $gh) { throw '未安装 GitHub CLI。请先运行“一键启动.bat”完成环境安装。' }
-    & $gh.Source auth status --hostname github.com *> $null
-    if ($LASTEXITCODE -ne 0) {
-        throw '这是一套私有仓库更新。请先在此电脑打开终端运行 gh auth login，并用拥有仓库访问权限的 GitHub 账号登录。'
-    }
-
     $repository = Resolve-Repository
-    $releaseText = (& $gh.Source release list --repo $repository --limit 100 --json tagName,publishedAt,isDraft,isPrerelease 2>$null) -join "`n"
-    if ($LASTEXITCODE -ne 0) { throw ('无法读取私有仓库 {0} 的版本，请检查账号权限和网络。' -f $repository) }
-    # Windows PowerShell 5.1 returns a JSON array as one nested pipeline
-    # value when ConvertFrom-Json is wrapped directly in @(...).  Parse first,
-    # then enumerate and wrap the filtered result so zero/one/many releases
-    # all have a reliable Count property.
-    $parsedReleases = $releaseText | ConvertFrom-Json
-    $releases = @($parsedReleases | Where-Object {
-        -not $_.isDraft -and -not $_.isPrerelease -and (Convert-SemVer ([string]$_.tagName))
-    })
-    if ($releases.Count -eq 0) { throw '仓库中还没有可用的稳定 v* Release。' }
-
-    $latest = $releases | Sort-Object @{ Expression = { Convert-SemVer ([string]$_.tagName) }; Descending = $true } | Select-Object -First 1
-    $latestTag = [string]$latest.tagName
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        $latest = Invoke-RestMethod -Uri ("https://api.github.com/repos/{0}/releases/latest" -f $repository) -Headers @{ 'User-Agent'='PULSE-Updater'; 'Accept'='application/vnd.github+json' } -TimeoutSec 20
+    } catch { throw '无法读取 GitHub 公开版本，请检查网络或稍后重试；无需登录。' }
+    if ($latest.draft -or $latest.prerelease -or -not (Convert-SemVer ([string]$latest.tag_name))) { throw '没有可用的稳定版本。' }
+    $latestTag = [string]$latest.tag_name
     $latestVersion = Convert-SemVer $latestTag
     $available = $latestVersion -gt $currentVersion
 
@@ -94,7 +79,7 @@ function Get-ReleaseState {
         currentVersion = $currentTag
         latestVersion = $latestTag
         repository = $repository
-        publishedAt = [string]$latest.publishedAt
+        publishedAt = [string]$latest.published_at
         message = if ($available) { '发现新版本 {0}，可以开始更新。' -f $latestTag } else { '当前已是最新版本 {0}。' -f $currentTag }
     }
 }
@@ -168,15 +153,15 @@ try {
     New-Item -ItemType Directory -Path $downloadRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
 
-    $gh = (Get-Command gh.exe -ErrorAction Stop).Source
     $assetName = 'PULSE-Windows-{0}.zip' -f $state.latestVersion
     $assetPath = Join-Path $downloadRoot $assetName
     $checksumName = '{0}.sha256' -f $assetName
     $checksumPath = Join-Path $downloadRoot $checksumName
-    & $gh release download $state.latestVersion --repo $state.repository --pattern $assetName --pattern $checksumName --dir $downloadRoot 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $assetPath) -or -not (Test-Path -LiteralPath $checksumPath)) {
-        throw ('Release 必须同时提供 {0} 和 {1}；缺少任一文件都不会安装。' -f $assetName, $checksumName)
-    }
+    try {
+        $baseUrl = "https://github.com/{0}/releases/download/{1}/" -f $state.repository, $state.latestVersion
+        Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + $assetName) -OutFile $assetPath -TimeoutSec 300
+        Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + $checksumName) -OutFile $checksumPath -TimeoutSec 60
+    } catch { throw '下载更新失败，请检查网络后重试；无需登录 GitHub。' }
 
     $checksumText = (Get-Content -LiteralPath $checksumPath -Raw -Encoding UTF8).Trim()
     $checksumMatch = [regex]::Match($checksumText, '^(?i)([0-9a-f]{64})(?:\s+\*?(.+))?$')
