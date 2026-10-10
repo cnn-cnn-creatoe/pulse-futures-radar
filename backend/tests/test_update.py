@@ -146,6 +146,21 @@ class UpdateServiceTests(unittest.TestCase):
             service.schedule_update()
         self.assertEqual(popen.call_count, 2)
 
+    def test_progress_reads_bom_stages_without_network_and_handles_partial_file(self):
+        service = UpdateService(self.root)
+        folder = self.root / ".runtime"
+        folder.mkdir()
+        path = folder / "update-status.json"
+        with patch("monitor.update.urlopen") as network:
+            self.assertEqual(service.progress()["status"], "idle")
+            path.write_text(json.dumps({"status":"downloading","message":"下载中"}), encoding="utf-8-sig")
+            self.assertEqual(service.progress()["status"], "downloading")
+            path.write_text("{", encoding="utf-8")
+            self.assertEqual(service.progress()["status"], "idle")
+            path.write_text(json.dumps({"status":"error","message":"校验失败"}), encoding="utf-8")
+            self.assertEqual(service.progress()["message"], "校验失败")
+            network.assert_not_called()
+
     def test_schedule_refuses_when_release_is_not_newer(self):
         service = UpdateService(self.root)
         latest = subprocess.CompletedProcess(

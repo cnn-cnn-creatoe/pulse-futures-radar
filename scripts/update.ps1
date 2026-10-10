@@ -22,6 +22,13 @@ function Write-Result($Value) {
     }
 }
 
+function Write-ProgressState([string]$State, [string]$Message) {
+    if ($Mode -ne 'Apply') { return }
+    $runtime = Join-Path $projectRoot '.runtime'
+    New-Item -ItemType Directory -Path $runtime -Force | Out-Null
+    [pscustomobject]@{status=$State; message=$Message; updatedAt=(Get-Date).ToUniversalTime().ToString('o')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runtime 'update-status.json') -Encoding UTF8
+}
+
 function Convert-SemVer([string]$Tag) {
     $match = [regex]::Match($Tag, '^v(\d+)\.(\d+)\.(\d+)$')
     if (-not $match.Success) { return $null }
@@ -125,6 +132,7 @@ function Assert-ReleaseManifest([string]$PayloadRoot, [string]$Version) {
 }
 
 try {
+    Write-ProgressState 'checking' '正在检查公开版本。'
     $state = Get-ReleaseState
     if ($Mode -eq 'Check' -or -not $state.updateAvailable) {
         Write-Result $state
@@ -157,12 +165,14 @@ try {
     $assetPath = Join-Path $downloadRoot $assetName
     $checksumName = '{0}.sha256' -f $assetName
     $checksumPath = Join-Path $downloadRoot $checksumName
+    Write-ProgressState 'downloading' '正在下载更新包和校验文件，请稍候。'
     try {
         $baseUrl = "https://github.com/{0}/releases/download/{1}/" -f $state.repository, $state.latestVersion
         Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + $assetName) -OutFile $assetPath -TimeoutSec 300
         Invoke-WebRequest -UseBasicParsing -Uri ($baseUrl + $checksumName) -OutFile $checksumPath -TimeoutSec 60
     } catch { throw '下载更新失败，请检查网络后重试；无需登录 GitHub。' }
 
+    Write-ProgressState 'verifying' '下载完成，正在校验安装包。'
     $checksumText = (Get-Content -LiteralPath $checksumPath -Raw -Encoding UTF8).Trim()
     $checksumMatch = [regex]::Match($checksumText, '^(?i)([0-9a-f]{64})(?:\s+\*?(.+))?$')
     if (-not $checksumMatch.Success) { throw 'Release 的 SHA256 文件格式无效。' }
@@ -173,6 +183,7 @@ try {
     $actualHash = (Get-Sha256 $assetPath).ToUpperInvariant()
     if ($actualHash -ne $expectedHash) { throw 'Release 资产 SHA256 校验失败，文件可能损坏或被替换，已停止更新。' }
 
+    Write-ProgressState 'extracting' '校验通过，正在解压并核对程序文件。'
     Expand-Archive -LiteralPath $assetPath -DestinationPath $extractRoot -Force
     $payloadRoot = Find-PayloadRoot $extractRoot $state.latestVersion
     Assert-ReleaseManifest $payloadRoot $state.latestVersion
@@ -215,6 +226,7 @@ catch {
             Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    Write-ProgressState 'error' $_.Exception.Message
     $failure = [pscustomobject]@{ ok = $false; status = 'error'; updateAvailable = $false; message = $_.Exception.Message }
     Write-Result $failure
     exit 1

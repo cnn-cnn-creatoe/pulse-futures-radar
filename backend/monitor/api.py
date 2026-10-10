@@ -254,6 +254,11 @@ def update_status(force: bool = False):
     return update_service.status(force=force)
 
 
+@app.get('/api/update/progress')
+def update_progress():
+    return update_service.progress()
+
+
 @app.post('/api/update/apply')
 def apply_update(request:Request):
     """Schedule only the updater shipped at the application's fixed path."""

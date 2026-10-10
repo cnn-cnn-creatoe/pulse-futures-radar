@@ -32,7 +32,7 @@ type Props = {
   online: boolean;
 };
 
-const CURRENT_VERSION = 'v3.0.3';
+const CURRENT_VERSION = 'v3.0.4';
 const UPDATE_POLL_MS = 30 * 60 * 1000;
 
 async function responseMessage(response: Response, fallback: string) {
@@ -56,6 +56,7 @@ export function UpdateControl({ api, online }: Props) {
   const [checking, setChecking] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState('');
+  const [progress, setProgress] = useState('');
   const mounted = useRef(true);
   const promptedVersion = useRef('');
   const reloadPoll = useRef<number | null>(null);
@@ -121,6 +122,7 @@ export function UpdateControl({ api, online }: Props) {
   const applyUpdate = async () => {
     if (!api || !status.update_available || !status.can_update) return;
     setUpdating(true);
+    setProgress('正在启动更新检查…');
     setError('');
     try {
       const response = await fetch(api + '/api/update/apply', {
@@ -138,27 +140,32 @@ export function UpdateControl({ api, online }: Props) {
           '正在下载并更新；看板会短暂离线，完成后自动重新打开。',
       }));
 
-      const oldVersion = status.current_version;
       const startedAt = Date.now();
       if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
       reloadPoll.current = window.setInterval(async () => {
         try {
-          const check = await fetch(api + '/api/update/status', {
+          const check = await fetch(api + '/api/update/progress', {
             cache: 'no-store',
             signal: AbortSignal.timeout(4000),
           });
           if (!check.ok) return;
-          const value = (await check.json()) as UpdateStatus;
-          if (
-            value.current_version !== oldVersion ||
-            Date.now() - startedAt > 120000
-          ) {
-            if (reloadPoll.current !== null)
-              window.clearInterval(reloadPoll.current);
+          const value = (await check.json()) as {status:string; message?:string};
+          setProgress(value.message || '正在更新…');
+          if (value.status === 'error') {
+            setError(value.message || '更新失败，请重试。');
+            setUpdating(false);
+            if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
+            reloadPoll.current = null;
+          } else if (value.status === 'complete') {
+            if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
             reloadPoll.current = null;
             window.location.reload();
           }
-        } catch {}
+        } catch {
+          setProgress(Date.now() - startedAt > 600000
+            ? '服务尚未恢复，请检查 .runtime/update.log；不要重复启动更新。'
+            : '服务暂时离线，正在等待重启恢复…');
+        }
       }, 3500);
     } catch (reason) {
       setUpdating(false);
@@ -204,6 +211,7 @@ export function UpdateControl({ api, online }: Props) {
             <span>最新版本</span>
             <b>{status.latest_version || '检查后显示'}</b>
           </div>
+          {updating && <p role="status" aria-live="polite">{progress}</p>}
           <p className="update-preserve-note">
             更新只替换程序文件，本机历史行情、回测结果、Telegram 密钥和用户设置都会保留。
           </p>

@@ -20,7 +20,7 @@ import time
 from typing import Callable
 
 
-CURRENT_VERSION = "v3.0.3"
+CURRENT_VERSION = "v3.0.4"
 DEFAULT_GITHUB_REPOSITORY = "cnn-cnn-creatoe/pulse-futures-radar"
 STATUS_CACHE_SECONDS = 60.0
 GH_TIMEOUT_SECONDS = 12.0
@@ -196,6 +196,20 @@ class UpdateService:
             self._cached_at = self._clock()
             return result
 
+    def progress(self) -> dict:
+        """Read local update stages without making a GitHub request."""
+        path = self.root / ".runtime" / "update-status.json"
+        try:
+            if path.stat().st_size > 65536:
+                raise ValueError("oversized")
+            value = json.loads(path.read_text(encoding="utf-8-sig"))
+            allowed = {"checking", "downloading", "verifying", "extracting", "stopping", "installing", "restarting", "complete", "error"}
+            if not isinstance(value, dict) or value.get("status") not in allowed:
+                raise ValueError("invalid")
+            return {key: value.get(key) for key in ("status", "message", "version", "updatedAt")}
+        except (OSError, ValueError, TypeError):
+            return {"status": "idle", "message": "尚未开始更新。"}
+
     def schedule_update(self) -> dict:
         """Detach the fixed updater without accepting any client arguments."""
         # Serialize double-clicks so at most one detached updater is launched.
@@ -229,6 +243,11 @@ class UpdateService:
             if os.name == "nt":
                 creation_flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             try:
+                runtime = self.root / ".runtime"
+                runtime.mkdir(parents=True, exist_ok=True)
+                (runtime / "update-status.json").write_text(json.dumps({
+                    "status": "checking", "message": "正在启动更新检查…"
+                }, ensure_ascii=False), encoding="utf-8")
                 process = subprocess.Popen(
                     [
                         powershell,
