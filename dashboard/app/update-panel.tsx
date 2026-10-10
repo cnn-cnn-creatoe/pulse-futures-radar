@@ -34,7 +34,7 @@ type Props = {
   hideButton?: boolean;
 };
 
-const CURRENT_VERSION = 'v3.0.5';
+const CURRENT_VERSION = 'v3.0.6';
 const UPDATE_POLL_MS = 30 * 60 * 1000;
 
 async function responseMessage(response: Response, fallback: string) {

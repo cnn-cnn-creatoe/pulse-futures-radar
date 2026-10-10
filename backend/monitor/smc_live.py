@@ -3,6 +3,7 @@ import asyncio
 import json
 import sqlite3
 import time
+import logging
 from datetime import datetime, timedelta, timezone
 import aiohttp
 from .collector import WS_BASE, rest_candle, eligible_contract
@@ -29,10 +30,17 @@ class SmcLive:
         self.db.commit()
 
     def desired(self):
-        if not self.telegram._accept_events: return set()
-        return {(s,tf) for member in self.telegram.state.subscribers() if member['preferences']['signals_enabled']
-                for p in profiles(member['preferences']) if p['rule_id']==RULE_ID
-                for s in p['symbols'] if equity(self.market._metadata.get(s,{})) for tf in p['timeframes']}
+        # Local monitoring is always independent of Telegram configuration.
+        wanted = {(symbol, period) for symbol, meta in self.market._metadata.items()
+                  if equity(meta) for period in ('1h', '4h', '1d')}
+        # Keep existing subscribers' additional periods without changing their rules.
+        if self.telegram and self.telegram._accept_events:
+            wanted.update((symbol, period)
+                for member in self.telegram.state.subscribers() if member['preferences']['signals_enabled']
+                for profile in profiles(member['preferences']) if profile['rule_id'] == RULE_ID
+                for symbol in profile['symbols'] if equity(self.market._metadata.get(symbol, {}))
+                for period in profile['timeframes'])
+        return wanted
 
     def start(self):
         self.task = asyncio.create_task(self.run())
@@ -44,23 +52,20 @@ class SmcLive:
         self.db.close()
 
     def status(self, day=None):
-        items = [dict(symbol=k[0],timeframe=k[1],**v) for k,v in self.states.items()]
+        wanted = sorted(self.desired())
+        items = [dict(symbol=symbol, timeframe=period, **self.states.get((symbol, period),
+                 dict(state='warming', note='等待本机加载历史行情，与 Telegram 推送无关')))
+                 for symbol, period in wanted]
         for item in items:
             if item.get('last_event') and self.market.now()-item['last_event']>15000:
                 item.update(state='waiting',note='最近15秒暂无新行情，等待更新')
-        for member in self.telegram.state.subscribers():
-            for p in profiles(member['preferences']):
-                if p['rule_id']!=RULE_ID: continue
-                for symbol in p['symbols']:
-                    if not equity(self.market._metadata.get(symbol,{})):
-                        items.append(dict(symbol=symbol,timeframe='/'.join(p['timeframes']),state='blocked',note='未核验为可交易美股，未启动监测'))
         tz = timezone(timedelta(hours=8))
         selected = datetime.strptime(day, '%Y-%m-%d').replace(tzinfo=tz) if day else datetime.fromtimestamp(self.market.now()/1000, tz).replace(hour=0, minute=0, second=0, microsecond=0)
         start = int(selected.timestamp()*1000)
         recent = [json.loads(r[0]) for r in self.db.execute('SELECT payload FROM triggers WHERE observed>=? AND observed<? ORDER BY observed DESC,id', (start,start+86400000))]
         days = [r[0] for r in self.db.execute("SELECT DISTINCT date(observed/1000, 'unixepoch', '+8 hours') AS day FROM triggers ORDER BY day DESC")]
         return dict(items=items, recent=recent, date=selected.strftime('%Y-%m-%d'), days=days, desired=len(self.desired()),
-                    note='实时K线更新触发；SMC内部5、波段50；严格突破结构位，不等收盘。空名单不监测。')
+                    note='本机默认全选可交易美股及1h/4h/1d，无需配置Telegram；新增上市品种自动加入。')
 
     async def run(self):
         while True:
@@ -103,9 +108,14 @@ class SmcLive:
                     event['zone_conflict']='结构向上突破，但价格仍在供给压力区内，暂不追多' if signal['direction']=='long' else '结构向下跌破，但价格仍在需求支撑区内，暂不追空'
             if prior_bars is not None:
                 event['assessment']=context(prior_bars,candle.close,signal['direction'],signal['level'])
-            if self.telegram.enqueue('signal',event):
-                self.db.execute('INSERT OR IGNORE INTO triggers VALUES (?,?,?)',(identity,event_time,json.dumps(event,ensure_ascii=False)))
-                self.db.commit()
+            self.db.execute('INSERT OR IGNORE INTO triggers VALUES (?,?,?)',(identity,event_time,json.dumps(event,ensure_ascii=False)))
+            self.db.commit()
+            # Persist first; unavailable/full/broken delivery must not lose local signals.
+            if self.telegram and self.telegram._accept_events:
+                try:
+                    self.telegram.enqueue('signal',event)
+                except Exception:
+                    logging.getLogger(__name__).exception('SMC 信号已本地保存，推送入队失败')
 
     async def watch(self, group):
         while True:

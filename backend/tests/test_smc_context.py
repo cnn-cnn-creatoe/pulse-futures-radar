@@ -40,7 +40,7 @@ class ContextTests(unittest.TestCase):
   b=bars()
   for c in b[-3:]:c.close=99
   with TemporaryDirectory() as folder:
-   path=Path(folder)/'smc.db';tg=SimpleNamespace(enqueue=Mock(return_value=True));market=SimpleNamespace(now=lambda:1000)
+   path=Path(folder)/'smc.db';tg=SimpleNamespace(_accept_events=True,enqueue=Mock(return_value=True));market=SimpleNamespace(now=lambda:1000)
    live=SmcLive(market,tg,path);live.desired=lambda:{('AAPLUSDT','1h')}
    signal=dict(structure='swing',tag='BOS',direction='long',level=101)
    live.publish(Candle('AAPLUSDT','1h',108000000,111599999,100,104,99,103,closed=False),1000,[signal],b)

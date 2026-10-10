@@ -79,7 +79,7 @@ class ZoneTests(unittest.TestCase):
   from monitor.smc_live import SmcLive
   from monitor.telegram import format_signal
   with TemporaryDirectory() as folder:
-   market=SimpleNamespace(now=lambda:1000);tg=SimpleNamespace(enqueue=Mock(return_value=True))
+   market=SimpleNamespace(now=lambda:1000);tg=SimpleNamespace(_accept_events=True,enqueue=Mock(return_value=True))
    live=SmcLive(market,tg,Path(folder)/'smc.db');live.desired=lambda:{('XOMUSDT','1h')}
    c=bar(1,o=99,h=105,l=98,c=104,closed=False)
    zones={'items':[dict(block(),phase='inside',confirmed=False)],'atr_ready':True,'history_bars':220}

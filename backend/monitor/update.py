@@ -20,7 +20,7 @@ import time
 from typing import Callable
 
 
-CURRENT_VERSION = "v3.0.5"
+CURRENT_VERSION = "v3.0.6"
 DEFAULT_GITHUB_REPOSITORY = "cnn-cnn-creatoe/pulse-futures-radar"
 STATUS_CACHE_SECONDS = 60.0
 GH_TIMEOUT_SECONDS = 12.0

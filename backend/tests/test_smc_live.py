@@ -94,14 +94,14 @@ class LiveTests(unittest.TestCase):
             path=Path(temp)/'test.db';live=SmcLive(market,tg,path)
             live.publish(candle(1,106),60000,sig);tg.enqueue.assert_not_called()
             tg.enqueue.return_value=False;live.publish(candle(1,106),69000,sig)
-            self.assertEqual(live.status()['recent'],[])
+            self.assertEqual(len(live.status()['recent']),1)
             tg.enqueue.return_value=True;live.publish(candle(1,106),69000,sig)
             live.publish(candle(1,106),69500,sig)
-            self.assertEqual(tg.enqueue.call_count,2)
+            self.assertEqual(tg.enqueue.call_count,1)
             text=format_signal(live.status()['recent'][0],p)
             self.assertIn('内部 BOS',text);self.assertIn('触发价：106',text);self.assertIn('本根已收盘',text)
             live.db.close();live=SmcLive(market,tg,path)
-            live.publish(candle(1,106),69900,sig);self.assertEqual(tg.enqueue.call_count,2)
+            live.publish(candle(1,106),69900,sig);self.assertEqual(tg.enqueue.call_count,1)
             live.db.close()
 
 class GroupingTests(unittest.IsolatedAsyncioTestCase):
@@ -175,3 +175,41 @@ class DailyHistoryTests(unittest.TestCase):
             self.assertEqual(reopened.status()['days'],['2026-10-09','2026-10-08','2026-10-07'])
             with self.assertRaises(ValueError):reopened.status('invalid')
             reopened.db.close()
+
+
+class LocalMonitoringTests(unittest.TestCase):
+    def market(self):
+        meta=dict(st=1,symbol='TSLAUSDT',status='TRADING',quoteAsset='USDT',contractType='TRADIFI_PERPETUAL',underlyingType='EQUITY')
+        return SimpleNamespace(now=lambda:70000,_metadata={'TSLAUSDT':meta,'BTCUSDT':dict(meta,symbol='BTCUSDT',underlyingType='COIN')})
+
+    def test_no_bot_defaults_all_equities_periods_and_restart_preserves_signal(self):
+        from dataclasses import replace
+        with TemporaryDirectory() as folder:
+            path=Path(folder)/'local.db'; market=self.market(); live=SmcLive(market,None,path)
+            self.assertEqual(live.desired(),{('TSLAUSDT',p) for p in ('1h','4h','1d')})
+            self.assertEqual(len(live.status()['items']),3)
+            bar=replace(candle(1,106),timeframe='1h')
+            sig=[dict(structure='internal',tag='BOS',direction='long',level=103)]
+            live.publish(bar,69000,sig)
+            saved=live.status()['recent'];self.assertEqual(len(saved),1)
+            live.db.close();live=SmcLive(market,None,path)
+            self.assertEqual(live.status()['recent'],saved)
+            live.publish(bar,69500,sig);self.assertEqual(live.status()['recent'],saved)
+            market._metadata['NVDAUSDT']=dict(market._metadata['TSLAUSDT'],symbol='NVDAUSDT')
+            self.assertEqual(len(live.desired()),6)
+            live.db.close()
+
+    def test_disabled_or_broken_telegram_cannot_prevent_local_storage(self):
+        from dataclasses import replace
+        for enabled in (False,True):
+            with self.subTest(enabled=enabled), TemporaryDirectory() as folder:
+                tg=SimpleNamespace(_accept_events=enabled,state=SimpleNamespace(subscribers=lambda:[]),enqueue=Mock(side_effect=RuntimeError('delivery down')))
+                live=SmcLive(self.market(),tg,Path(folder)/'local.db')
+                bar=replace(candle(1,106),timeframe='4h')
+                sig=[dict(structure='internal',tag='BOS',direction='long',level=103)]
+                if enabled:
+                    with self.assertLogs('monitor.smc_live',level='ERROR'):live.publish(bar,69000,sig)
+                else:
+                    live.publish(bar,69000,sig);tg.enqueue.assert_not_called()
+                self.assertEqual(len(live.status()['recent']),1)
+                live.db.close()
