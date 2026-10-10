@@ -34,7 +34,7 @@ type Props = {
   hideButton?: boolean;
 };
 
-const CURRENT_VERSION = 'v3.0.6';
+const CURRENT_VERSION = 'v3.0.7';
 const UPDATE_POLL_MS = 30 * 60 * 1000;
 
 async function responseMessage(response: Response, fallback: string) {
@@ -62,13 +62,14 @@ export function UpdateControl({ api, online, hideButton = false }: Props) {
   const [completed, setCompleted] = useState('');
   const pendingVersion = useRef('');
   const busy = useRef(false);
+  const checkingRef = useRef(false);
   const mounted = useRef(true);
   const promptedVersion = useRef('');
   const reloadPoll = useRef<number | null>(null);
 
   const checkUpdate = useCallback(
     async (force = false) => {
-      if (busy.current) return;
+      if (busy.current || checkingRef.current) return;
       if (!api || !online) {
         setStatus((previous) => ({
           ...previous,
@@ -79,6 +80,7 @@ export function UpdateControl({ api, online, hideButton = false }: Props) {
         }));
         return;
       }
+      checkingRef.current = true;
       setChecking(true);
       setError('');
       try {
@@ -86,7 +88,7 @@ export function UpdateControl({ api, online, hideButton = false }: Props) {
           api + '/api/update/status' + (force ? '?force=true' : ''),
           {
             cache: 'no-store',
-            signal: AbortSignal.timeout(15000),
+            signal: AbortSignal.timeout(30000),
           },
         );
         if (!response.ok)
@@ -106,9 +108,13 @@ export function UpdateControl({ api, online, hideButton = false }: Props) {
           setOpen(true);
         }
       } catch (reason) {
-        if (mounted.current)
-          setError(reason instanceof Error ? reason.message : '版本检查失败。');
+        if (mounted.current) {
+          const timeout = reason instanceof Error && (reason.name === 'TimeoutError' || reason.name === 'AbortError' || /timed? ?out/i.test(reason.message));
+          setError(timeout ? '检查更新超时，暂时无法确认最新版本，请稍后重试。当前版本可以继续使用。' : '暂时无法连接更新服务，请检查网络后重试。当前版本可以继续使用。');
+          setStatus(previous => ({...previous, latest_version:null, update_available:false, can_update:false}));
+        }
       } finally {
+        checkingRef.current = false;
         if (mounted.current) setChecking(false);
       }
     },
@@ -221,6 +227,7 @@ export function UpdateControl({ api, online, hideButton = false }: Props) {
 
   const newest = status.latest_version || status.current_version;
   const hasUpdate = status.update_available && status.can_update;
+  const upToDate = !checking && !error && !!status.latest_version && status.latest_version === status.current_version;
 
   return (
     <>
@@ -250,14 +257,14 @@ export function UpdateControl({ api, online, hideButton = false }: Props) {
             <span className={'update-dialog-icon ' + (hasUpdate ? 'has-update' : '')}>
               {hasUpdate ? <CloudDownload /> : <ShieldCheck />}
             </span>
-            <DialogTitle>{completed ? '更新完成' : updating ? '正在更新' : hasUpdate ? '发现新版本' : '应用更新'}</DialogTitle>
-            <DialogDescription>{completed ? `已更新到 ${completed}，服务已恢复。` : error || status.message}</DialogDescription>
+            <DialogTitle>{completed ? '更新完成' : updating ? '正在更新' : checking ? '正在检查更新' : upToDate ? '已是最新版本，无需更新' : hasUpdate ? '发现新版本' : '应用更新'}</DialogTitle>
+            <DialogDescription>{completed ? `已更新到 ${completed}，服务已恢复。` : checking ? '正在连接 GitHub 检查最新版本，请稍候…' : error || (upToDate ? '当前版本已是最新版本，无需更新。' : status.message)}</DialogDescription>
           </DialogHeader>
           <div className="update-version-row">
             <span>当前版本</span>
             <b>{completed || status.current_version || CURRENT_VERSION}</b>
             <span>最新版本</span>
-            <b>{status.latest_version || '检查后显示'}</b>
+            <b>{checking ? '正在检查…' : status.latest_version || '暂未确认'}</b>
           </div>
           {updating && <p role="status" aria-live="polite">{progress}<br/><small>下载时信号继续刷新；安装重启期间暂时停止刷新。</small></p>}
           <p className="update-preserve-note">

@@ -20,7 +20,7 @@ import time
 from typing import Callable
 
 
-CURRENT_VERSION = "v3.0.6"
+CURRENT_VERSION = "v3.0.7"
 DEFAULT_GITHUB_REPOSITORY = "cnn-cnn-creatoe/pulse-futures-radar"
 STATUS_CACHE_SECONDS = 60.0
 GH_TIMEOUT_SECONDS = 12.0
@@ -169,7 +169,7 @@ class UpdateService:
         result["update_available"] = latest_parts > current_parts
         if not result["update_available"]:
             result["message"] = (
-                "当前已是最新版本。"
+                "当前已是最新版本，无需更新。"
                 if latest_parts == current_parts
                 else "当前版本不低于 GitHub 最新稳定版。"
             )
