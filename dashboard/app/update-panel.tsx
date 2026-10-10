@@ -32,7 +32,7 @@ type Props = {
   online: boolean;
 };
 
-const CURRENT_VERSION = 'v1.0.2';
+const CURRENT_VERSION = 'v2.0.0';
 const UPDATE_POLL_MS = 30 * 60 * 1000;
 
 async function responseMessage(response: Response, fallback: string) {

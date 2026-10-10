@@ -34,7 +34,7 @@ function Write-UpdateStatus([string]$Status, [string]$Message) {
 
 function Test-Preserved([string]$RelativePath) {
     $path = $RelativePath.Replace('/', '\')
-    foreach ($prefix in @('.git\', '.runtime\', '.venv\', 'backend\data\', 'dashboard\node_modules\', 'dashboard\dist\', 'release\', '回测结果\')) {
+    foreach ($prefix in @('backups\','research\','outputs\','.git\', '.runtime\', '.venv\', 'backend\data\', 'dashboard\node_modules\', 'dashboard\dist\', 'release\', '回测结果\')) {
         if ($path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
     if ($path -match '(^|\\)(__pycache__|\.pytest_cache|\.wrangler)(\\|$)') { return $true }

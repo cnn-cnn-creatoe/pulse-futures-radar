@@ -10,7 +10,7 @@ $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $runtimeRoot = Join-Path $projectRoot '.runtime'
 
 function Write-StopMessage([string]$Message, [ConsoleColor]$Color = [ConsoleColor]::Cyan) {
-    if (-not $Quiet) { Write-Host ('[PULSE] {0}' -f $Message) -ForegroundColor $Color }
+    if (-not $Quiet) { Write-Host ('[合约推送] {0}' -f $Message) -ForegroundColor $Color }
 }
 
 function Get-DescendantIds([int]$RootId) {

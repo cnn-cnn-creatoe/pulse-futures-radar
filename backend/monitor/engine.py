@@ -10,12 +10,18 @@ This module performs no I/O and sends no notifications.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from .periods import floor_bar, shift
 import math
 from statistics import fmean, median
 from typing import Any
 
 
 TIMEFRAME_MS = {
+    "1s": 1000,
+    "4h": 14_400_000,
+    "1w": 604_800_000,
+    "1M": 2_592_000_000, # sizing estimate only; use periods for boundaries
+
     "1m": 60_000,
     "5m": 300_000,
     "15m": 900_000,
@@ -29,6 +35,11 @@ TIMEFRAME_MS = {
 # internally to build closed 5m/15m candles.
 MONITOR_TIMEFRAMES = ("5m", "15m")
 LOOKBACK = {
+    "1s": {"days": 1, "minimum_bars": 300},
+    "4h": {"days": 60, "minimum_bars": 90},
+    "1w": {"days": 365, "minimum_bars": 26},
+    "1M": {"days": 1095, "minimum_bars": 12},
+
     "1m": {"days": 3, "minimum_bars": 1440},
     "5m": {"days": 7, "minimum_bars": 864},
     "15m": {"days": 7, "minimum_bars": 288},
@@ -204,6 +215,7 @@ def analyze(
     config: EngineConfig | None = None,
     enrichment: dict[str, Any] | None = None,
     tick_size: float = 1e-8,
+    *, score_only: bool = False,
 ) -> dict[str, Any]:
     """Analyze the final pair, including explicit reasons when it is unusable.
 
@@ -236,9 +248,9 @@ def analyze(
             return {**result, "status": "open_candle"}
         if not isinstance(candle.open_time, int) or not isinstance(candle.close_time, int):
             return {**result, "status": "invalid_timestamp"}
-        if candle.open_time % interval or candle.close_time != candle.open_time + interval - 1:
+        if floor_bar(candle.open_time,timeframe) != candle.open_time or candle.close_time != shift(candle.open_time,timeframe) - 1:
             return {**result, "status": "invalid_timestamp"}
-        if i and candle.open_time != used[i - 1].open_time + interval:
+        if i and candle.open_time != shift(used[i - 1].open_time,timeframe):
             return {**result, "status": "gap"}
         if not _valid_prices(candle) or not _valid_volume(candle):
             return {**result, "status": "invalid_data"}
@@ -284,9 +296,9 @@ def analyze(
     is_doji = "十字" in (first_kind, second_kind)
     pattern = "十字组合" if is_doji else first_kind + second_kind
     result["pattern"] = pattern
-    if (is_doji and not config.allow_doji) or (config.pattern_mode == "mixed_only" and pattern not in {"阴阳", "阳阴"}):
+    if not score_only and ((is_doji and not config.allow_doji) or (config.pattern_mode == "mixed_only" and pattern not in {"阴阳", "阳阴"})):
         return {**result, "status": "pattern_filtered"}
-    if ratio < config.volatility_ratio_min:
+    if not score_only and ratio < config.volatility_ratio_min:
         return result
 
     pair_range = max(first.high, second.high) - min(first.low, second.low)
@@ -420,15 +432,19 @@ def aggregate_minutes(candles: list[Candle], timeframe: str) -> list[Candle]:
         raise ValueError(f"unsupported timeframe: {timeframe}")
     interval = TIMEFRAME_MS[timeframe]
     minute = TIMEFRAME_MS["1m"]
-    count = interval // minute
+    if interval < minute:
+        raise ValueError("不能从分钟行情还原秒级行情")
+    from .periods import floor_bar, shift
     buckets: dict[tuple[str, int], list[Candle]] = {}
     for candle in candles:
         if not isinstance(candle.open_time, int):
             continue
-        start = candle.open_time // interval * interval
+        start = floor_bar(candle.open_time, timeframe)
         buckets.setdefault((candle.symbol, start), []).append(candle)
     output: list[Candle] = []
     for (symbol, start), members in sorted(buckets.items(), key=lambda item: (item[0][1], item[0][0])):
+        end = shift(start, timeframe)
+        count = (end - start) // minute
         if len(members) != count:
             continue
         members.sort(key=lambda candle: candle.open_time)
@@ -447,7 +463,7 @@ def aggregate_minutes(candles: list[Candle], timeframe: str) -> list[Candle]:
             symbol=symbol,
             timeframe=timeframe,
             open_time=start,
-            close_time=start + interval - 1,
+            close_time=end - 1,
             open=members[0].open,
             high=max(candle.high for candle in members),
             low=min(candle.low for candle in members),

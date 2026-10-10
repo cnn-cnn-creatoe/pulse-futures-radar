@@ -59,7 +59,7 @@ class ExpandedDemoTests(unittest.TestCase):
             self.assertIs(row["synthetic"], True)
             self.assertEqual(row["quality_schema_version"], 2)
             self.assertEqual(row["qualified"], not row["quality_reasons"])
-            self.assertEqual({item["id"] for item in row["confirmations"]}, {"supertrend", "smc"})
+            self.assertEqual({item["id"] for item in row["confirmations"]}, {"wt_extreme_cross"})
             if row["qualified"]:
                 self.assertTrue(all(item["passed"] for item in row["confirmations"]))
                 self.assertIsNotNone(row["trade_plan"])
@@ -68,10 +68,10 @@ class ExpandedDemoTests(unittest.TestCase):
         self.assertEqual({row["timeframe"] for row in first}, set(MONITOR_TIMEFRAMES))
 
     def test_optional_policy_preview_and_existing_engine_filter_signature(self):
-        rows = demo_signals(EngineConfig(pattern_mode="mixed_only"), indicator_config=IndicatorConfig(enabled_indicators=("ema",)), quality={"min_activity_score": 100})
+        rows = demo_signals(EngineConfig(pattern_mode="mixed_only"), indicator_config=IndicatorConfig(enabled_indicators=("wt_extreme_cross",)), quality={"min_activity_score": 100})
         self.assertEqual(len(rows), 4)
         self.assertEqual({row["pattern"] for row in rows}, {"阴阳", "阳阴"})
-        self.assertTrue(all([item["id"] for item in row["confirmations"]] == ["ema"] for row in rows))
+        self.assertTrue(all([item["id"] for item in row["confirmations"]] == ["wt_extreme_cross"] for row in rows))
         self.assertTrue(all(not row["qualified"] for row in rows))
 
 

@@ -13,3 +13,7 @@ The Supertrend implementation follows the separate Pine v4 formula supplied by t
 Technical reference for Pine true-range warm-up semantics: TradingView, [Built-ins](https://www.tradingview.com/pine-script-docs/language/built-ins/). `tr` and `tr(true)` differ when the previous close is unavailable.
 
 Screening and reference trade-plan calculations are new integration logic. They do not place orders, guarantee a winning trade, replace execution checks, or provide a reliable estimate of future returns. Fees/slippage/spread are configurable assumptions; future funding and liquidation effects are not modeled by the indicator module.
+
+## v3 independent live SMC adaptation
+
+`monitor/smc_structure.py` and `monitor/smc_context.py` retain the LuxAlgo attribution and CC BY-NC-SA 4.0 terms for adapted portions. The independent live module uses internal/swing structure and ATR200-filtered supply/demand blocks, with intrabar preview, zone reactions and invalidation. These live observations can change before candle close; the closed-candle guarantees above describe the separate confirmed chart implementation, not live previews.

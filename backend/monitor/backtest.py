@@ -23,19 +23,13 @@ TIMEFRAME_PRIORS = {"1m": 3.0, "5m": 2.5, "15m": 2.0, "30m": 2.0,
                     "1h": 2.0, "2h": 1.8, "1d": 1.5}
 ENRICHMENT_FIELDS = ("oi_change_pct", "oi_ratio", "liquidity_percentile", "spread_bps")
 INDICATOR_STUDY_COMBINATIONS = (
-    ("supertrend", ("supertrend",), "Supertrend"),
-    ("smc", ("smc",), "SMC"),
-    ("ema", ("ema",), "EMA"),
-    ("supertrend_smc", ("supertrend", "smc"), "Supertrend + SMC"),
-    ("supertrend_ema", ("supertrend", "ema"), "Supertrend + EMA"),
-    ("smc_ema", ("smc", "ema"), "SMC + EMA"),
-    ("supertrend_smc_ema", ("supertrend", "smc", "ema"), "Supertrend + SMC + EMA"),
+    ("wt_extreme_cross", ("wt_extreme_cross",), "WaveTrend · 超买超卖交叉"),
 )
 INDICATOR_STUDY_WARNINGS = [
     "Primary rows are a Kline-only indicator ablation, not the configured live full policy; strict results remain under each row.policies.strict_full_policy.",
     "The 70/30 holdout and three anchored walk-forward folds are chronological diagnostics; a future unseen period is still required before deployment.",
     "Deflated Sharpe Ratio (DSR) and Probability of Backtest Overfitting (PBO) have not been calculated.",
-    "Seven predeclared trials do not establish a best combination; these results cannot be used to select one without further unseen validation.",
+    "WaveTrend results cannot be used to select a trading strategy without further unseen validation.",
     "All rows retain the same support/resistance and net risk/reward screen; only indicator confirmations differ.",
 ]
 
@@ -551,9 +545,9 @@ def run_backtest(candles: list[Candle], engine_config: EngineConfig | None = Non
                 "quality_reasons": evaluated.get("quality_reasons", [])})
         # Each study row sees this exact same closed prefix and base anomaly.
         # Only enabled confirmations change; support/resistance, risk/reward and
-        # quality/cost rules remain common across all seven predeclared indicator sets.
+        # quality/cost rules remain common across the retained indicator.
         # indicator_context always calculates all three registered states. Reuse
-        # this exact same causal context so seven indicator rows do not repeat expensive
+        # this exact same causal context so indicator rows do not repeat expensive
         # SMC scans and cannot observe subtly different data.
         shared_context = evaluations[0].get("indicator_context") if evaluations else None
         for study_id, enabled, _ in INDICATOR_STUDY_COMBINATIONS:

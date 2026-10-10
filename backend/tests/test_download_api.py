@@ -62,6 +62,7 @@ class DownloadApiTests(unittest.TestCase):
         sys.modules[self.module_name] = self.api
         self.addCleanup(sys.modules.pop, self.module_name, None)
         spec.loader.exec_module(self.api)
+        self.api.APPLICATION_ROOT = Path(self.folder.name)
         self.client = TestClient(self.api.app)
         self.client.__enter__()
         self.addCleanup(self.client.__exit__, None, None, None)

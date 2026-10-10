@@ -30,10 +30,11 @@ import aiohttp
 
 BOT_TOKEN_ENV = "PULSE_TELEGRAM_BOT_TOKEN"
 BOT_TOKEN_PATTERN = re.compile(r"^[0-9]{6,16}:[A-Za-z0-9_-]{30,128}$")
-TIMEFRAMES = ("5m", "15m")
+from .selected_period_rules import TIMEFRAMES
+ANOMALY_TIMEFRAMES=('5m','15m')
 DIRECTIONS = ("long", "short")
-ACTIVITY_LEVELS = (65, 80, 90)
-STRATEGIES = ("supertrend", "smc")
+ACTIVITY_LEVELS = (0, 35, 50, 65, 80, 90)
+STRATEGIES = ("wt_extreme_cross", "nan_strategy1_oversold")
 STRATEGY_MODES = ("any", "all")
 PAIRING_TTL_SECONDS = 600
 MAX_CALLBACK_BYTES = 64
@@ -49,6 +50,11 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     "signal_scope": "activity",
     "strategies": [],
     "strategy_mode": "any",
+    "event_kind": "anomaly",
+    "rules": [],
+    "patterns": [],
+    "min_actionability": 0,
+    "require_book": False,
     "listing_enabled": True,
     # Binding proves chat ownership but does not itself opt into market signal
     # delivery.  The user must explicitly enable signals in the menu or page.
@@ -67,8 +73,8 @@ QUICK_MENU_COMMANDS = {
 }
 
 STRATEGY_LABELS = {
-    "supertrend": "超级趋势",
-    "smc": "智慧资金结构（SMC）",
+    "wt_extreme_cross": "WaveTrend · 超买超卖交叉",
+    "nan_strategy1_oversold": "楠策略1超买超卖",
 }
 CONTRACT_TYPE_LABELS = {
     "PERPETUAL": "永续合约",
@@ -114,6 +120,26 @@ def validate_bot_token(value: str) -> str:
     return token
 
 
+def migrate_preferences(value):
+    """Prune stored retired subscriptions without enabling broader notifications."""
+    p=deepcopy(value or {})
+    old=p.get('strategies',[])
+    removed=any(r not in ('wt_extreme_cross','nan_strategy1_oversold') for r in old)
+    p['strategies']=[r for r in old if r in ('wt_extreme_cross','nan_strategy1_oversold')]
+    saved=p.get('rule_settings')
+    if saved is not None:
+        p['rule_settings']=[r for r in saved if r.get('kind')=='indicator' and r.get('rule_id') in ('wt_extreme_cross','nan_strategy1_oversold','smc_equity_structure')]
+        if saved and not p['rule_settings']:p['signals_enabled']=False
+    rules=p.get('rules',[])
+    if p.get('event_kind')=='quant':
+        p.update(event_kind='indicator',rules=[],rule_settings=[],signals_enabled=False)
+    else:
+        p['rules']=[r for r in rules if r in ('wt_extreme_cross','nan_strategy1_oversold','smc_equity_structure')]
+        if rules and not p['rules'] and saved is None:p.update(rule_settings=[],signals_enabled=False)
+    if removed and not p['strategies'] and saved is None:p['signals_enabled']=False
+    return p
+
+
 def normalize_preferences(value: dict[str, Any] | None) -> dict[str, Any]:
     """Return a canonical copy and reject ambiguous or unsupported filters."""
     provided = dict(value or {})
@@ -127,20 +153,34 @@ def normalize_preferences(value: dict[str, Any] | None) -> dict[str, Any]:
     directions = list(dict.fromkeys(source.get("directions") or []))
     strategies = list(dict.fromkeys(source.get("strategies") or []))
     if not timeframes or any(item not in TIMEFRAMES for item in timeframes):
-        raise ValueError("周期至少选择一个，且仅支持 5m、15m")
+        raise ValueError("周期至少选择一个；支持1m、5m、15m、30m、1h、4h、1d、1w、1M")
     if not directions or any(item not in DIRECTIONS for item in directions):
         raise ValueError("方向至少选择一个，且仅支持 long、short")
     if source.get("min_activity") not in ACTIVITY_LEVELS:
-        raise ValueError("最低活跃度仅支持 65、80、90")
+        raise ValueError("最低活跃度仅支持 0、35、50、65、80、90（原分）")
     if source.get("signal_scope") not in {"activity", "qualified"}:
         raise ValueError("signal_scope 仅支持 activity、qualified")
     if any(item not in STRATEGIES for item in strategies):
-        raise ValueError("策略仅支持 supertrend、smc")
+        raise ValueError("仅支持 WaveTrend 超买超卖交叉")
+    from .live_rule_signals import rule_catalog
+    kind=source.get('event_kind')
+    if kind not in ('anomaly','indicator','quant'):raise ValueError('请选择异常、指标或策略事件')
+    if kind=='anomaly' and any(tf not in ANOMALY_TIMEFRAMES for tf in timeframes):raise ValueError('两K异常仅支持5m、15m；其他周期请选择指标或策略事件')
+    allowed={r['id'] for r in rule_catalog(kind)}
+    rules=list(dict.fromkeys(source.get('rules') or []))
+    patterns=list(dict.fromkeys(source.get('patterns') or []))
+    if any(r not in allowed for r in rules):raise ValueError('仅可选择已接入的事件规则')
+    if any(p not in ('阳阳','阴阴','阳阴','阴阳') for p in patterns):raise ValueError('未知形态')
+    minimum=source.get('min_actionability')
+    if isinstance(minimum,bool) or not isinstance(minimum,(int,float)) or not 0<=minimum<=100:raise ValueError('可操作度门槛应为0至100')
     if source.get("strategy_mode") not in STRATEGY_MODES:
         raise ValueError("strategy_mode 仅支持 any、all")
+    from .delivery_profiles import normalize_profiles
     return {
+        "rule_settings":normalize_profiles(source.get('rule_settings')),
         "timeframes": [item for item in TIMEFRAMES if item in timeframes],
         "directions": [item for item in DIRECTIONS if item in directions],
+        "event_kind":kind,"rules":rules,"patterns":patterns,"min_actionability":minimum,"require_book":bool(source.get("require_book")),
         "min_activity": int(source["min_activity"]),
         "signal_scope": source["signal_scope"],
         # [] is the explicit empty strategy.  It is never stored alongside an
@@ -155,6 +195,11 @@ def normalize_preferences(value: dict[str, Any] | None) -> dict[str, Any]:
 def reset_filter_preferences(value: dict[str, Any] | None) -> dict[str, Any]:
     """Reset filters while preserving the user's two delivery opt-ins."""
     current = normalize_preferences(value)
+    if current.get("rule_settings") is not None:
+        return normalize_preferences({**current, "rule_settings": [
+            {**row, "min_activity": 0, "min_actionability": 0, "patterns": [], "symbols": []}
+            for row in current["rule_settings"]
+        ]})
     return normalize_preferences({
         "timeframes": ["5m", "15m"],
         "directions": ["long", "short"],
@@ -284,7 +329,7 @@ class TelegramConfigStore:
         try:
             raw = json.loads(self.path.read_text("utf-8"))
             return {"enabled": raw.get("enabled") is True,
-                    "preferences": normalize_preferences(raw.get("preferences"))}
+                    "preferences": normalize_preferences(migrate_preferences(raw.get("preferences")))}
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return {"enabled": False, "preferences": deepcopy(DEFAULT_PREFERENCES)}
 
@@ -439,6 +484,8 @@ class TelegramState:
                 int(chat_id), int(user_id), _clean_label(chat_label),
                 json.dumps(normalize_preferences(preferences), ensure_ascii=False), now_ms, now_ms))
             self._db.execute("DELETE FROM telegram_meta WHERE key IN ('pairing_hash','pairing_expires_at')")
+            self._db.execute("UPDATE access_requests SET status='approved',decided_at=?,decided_by=? WHERE user_id=?",
+                             (now_ms, int(user_id), int(user_id)))
             return True
 
     @staticmethod
@@ -447,7 +494,7 @@ class TelegramState:
             return None
         return {"chat_id": int(row["chat_id"]), "bound_user_id": int(row["bound_user_id"]),
                 "chat_label": row["chat_label"],
-                "preferences": normalize_preferences(json.loads(row["preferences"])),
+                "preferences": normalize_preferences(migrate_preferences(json.loads(row["preferences"]))),
                 "created_at": int(row["created_at"]), "updated_at": int(row["updated_at"]),
                 "role": row["role"], "active": bool(row["active"])}
 
@@ -899,7 +946,7 @@ class TelegramService:
         await self._rate_wait(subscriber["chat_id"])
         await self._client.call("sendMessage", {
             "chat_id": subscriber["chat_id"],
-            "text": "PULSE｜连接测试\n\nTelegram 纯文字推送已连接。\n此消息不代表行情或交易信号。",
+            "text": "合约推送｜连接测试\n\nTelegram 纯文字推送已连接。\n此消息不代表行情或交易信号。",
             "disable_web_page_preview": True,
         })
         return {"sent": True, "masked_chat_id": _mask_chat_id(subscriber["chat_id"])}
@@ -995,6 +1042,9 @@ class TelegramService:
             else:
                 await self._handle_admin_command(chat_id, user_id, command, argument)
             return
+        if command == 'coins':
+            from .delivery_menu import coins
+            await coins(self,member,argument);return
         if command == "reset":
             preferences = reset_filter_preferences(member["preferences"])
             self.state.update_preferences(preferences, chat_id=chat_id)
@@ -1030,7 +1080,7 @@ class TelegramService:
             payload = {
                 "chat_id": admin["chat_id"],
                 "text": "\n".join([
-                    "PULSE｜新的使用申请", "", f"显示名：{request['display_name']}",
+                    "合约推送｜新的使用申请", "", f"显示名：{request['display_name']}",
                     f"用户名：{username}", f"Telegram ID：{request['user_id']}",
                     "", "请确认身份后再批准。",
                 ]),
@@ -1052,6 +1102,8 @@ class TelegramService:
                 notice = "🔒 你的使用权限已取消。如需恢复，请联系管理员，由管理员重新授权。"
             elif status == "approved":
                 notice = "🔒 授权状态需要管理员复核，请联系管理员重新授权。"
+            elif admin is None:
+                notice = "尚未绑定首位管理员。请在运行程序的电脑打开「系统与推送 → 连接与绑定」，生成安全链接。若无法打开客户端，复制页面中的完整绑定命令，在本聊天发送。普通 /start 不能完成管理员绑定。"
             else:
                 notice = "🔒 当前机器人为私有机器人。申请已提交，请等待管理员授权。"
             await self._send_text(chat_id, notice)
@@ -1060,7 +1112,7 @@ class TelegramService:
                                     argument: str | None) -> None:
         if command == "users":
             members = self.state.subscribers()
-            lines = ["PULSE｜已授权用户", ""]
+            lines = ["合约推送｜已授权用户", ""]
             lines.extend(f"{'管理员' if item['role'] == 'admin' else '用户'}｜{item['chat_label']}｜ID {item['bound_user_id']}"
                          for item in members)
             await self._send_text(chat_id, "\n".join(lines))
@@ -1075,13 +1127,13 @@ class TelegramService:
         if command == "add":
             member = self.state.add_user(target, user_id, self._new_user_preferences())
             await self._send_text(chat_id, f"已授权：{member.get('chat_label')}｜ID {target}")
-            await self._send_text(target, "你的 PULSE 使用申请已通过。发送 /menu 设置独立推送条件。")
+            await self._send_text(target, "你的合约推送使用申请已通过。发送 /menu 设置独立推送条件。")
             await self._send_shortcuts(target, is_admin=False)
         elif command == "remove":
             removed = self.state.remove_user(target, user_id)
             if removed:
                 await self._send_text(chat_id, f"已取消授权：{removed['chat_label']}｜ID {target}")
-                await self._send_text(removed["chat_id"], "你的 PULSE 使用权限已被管理员取消。")
+                await self._send_text(removed["chat_id"], "你的合约推送使用权限已被管理员取消。")
             else:
                 await self._send_text(chat_id, "未找到可移除的普通授权用户；管理员不能在 Telegram 内移除自己。")
 
@@ -1106,9 +1158,40 @@ class TelegramService:
             return
         subscriber = self.state.subscriber(chat_id=chat_id, user_id=user_id)
         preferences = deepcopy(subscriber["preferences"])
+        if data.startswith('q:'):
+            from .delivery_menu import handle
+            await self._answer_callback(query_id,'已打开独立规则设置')
+            await handle(self,subscriber,data,message_id);return
         note = "已更新"
+        menu_page=0
         parts = data.split(":")
-        if parts[:2] == ["p", "tf"] and len(parts) == 3 and parts[2] in TIMEFRAMES:
+        if parts[:2]==['p','page'] and len(parts)==3 and parts[2].isdigit():
+            await self._answer_callback(query_id,'已翻页')
+            await self._send_menu(chat_id,edit_message_id=message_id,page=int(parts[2]));return
+        if parts[:2]==['p','source'] and len(parts)==3 and parts[2] in ('anomaly','indicator','quant'):
+            preferences.update(event_kind=parts[2],rules=[])
+            if parts[2]=='anomaly':preferences['timeframes']=[tf for tf in preferences['timeframes'] if tf in ANOMALY_TIMEFRAMES] or list(ANOMALY_TIMEFRAMES)
+        elif parts[:2]==['p','rule'] and len(parts)==3:
+            from .live_rule_signals import rule_catalog
+            rule_ids=[r['id'] for r in rule_catalog(preferences['event_kind'])]
+            if parts[2] not in rule_ids:return
+            menu_page=rule_ids.index(parts[2])//6
+            selected=preferences['rules'];selected.remove(parts[2]) if parts[2] in selected else selected.append(parts[2])
+        elif data in ('p:rules:all','p:rules:none'):
+            from .live_rule_signals import rule_catalog
+            preferences['rules']=[r['id'] for r in rule_catalog(preferences['event_kind']) if r['id']!='smc_equity_structure'] if data.endswith('all') else []
+        elif parts[:2]==['p','pattern'] and len(parts)==3:
+            values=['阳阳','阴阴','阳阴','阴阳'];v=parts[2]
+            if v in ('none','all'):preferences['patterns']=values if v=='all' else []
+            elif v in ('0','1','2','3'):
+                item=values[int(v)];selected=preferences['patterns'];selected.remove(item) if item in selected else selected.append(item)
+        elif data=='p:book':preferences['require_book']=not preferences['require_book']
+        elif data=='p:action':
+            levels=[0,40,60,80,90];current=preferences['min_actionability'];preferences['min_actionability']=next((v for v in levels if v>current),0)
+        elif parts[:2] == ["p", "tf"] and len(parts) == 3 and parts[2]=='all':
+            preferences['timeframes']=list(ANOMALY_TIMEFRAMES if preferences['event_kind']=='anomaly' else TIMEFRAMES)
+        elif parts[:2] == ["p", "tf"] and len(parts) == 3 and parts[2] in TIMEFRAMES:
+            if preferences['event_kind']=='anomaly' and parts[2] not in ANOMALY_TIMEFRAMES:return
             note = _toggle_required(preferences["timeframes"], parts[2], "至少保留一个周期")
         elif parts[:2] == ["p", "dir"] and len(parts) == 3 and parts[2] in DIRECTIONS:
             note = _toggle_required(preferences["directions"], parts[2], "至少保留一个方向")
@@ -1141,7 +1224,7 @@ class TelegramService:
         if subscriber["role"] == "admin":
             self.config.update(preferences=preferences)
         await self._answer_callback(query_id, note)
-        await self._send_menu(chat_id, edit_message_id=message_id if isinstance(message_id, int) else None)
+        await self._send_menu(chat_id, edit_message_id=message_id if isinstance(message_id, int) else None,page=menu_page)
 
     async def _handle_admin_callback(self, query_id: str, data: str, chat_id: int,
                                      user_id: int, message_id: Any) -> None:
@@ -1163,15 +1246,15 @@ class TelegramService:
         if self._client is not None and isinstance(message_id, int):
             await self._client.call("editMessageText", {
                 "chat_id": chat_id, "message_id": message_id,
-                "text": f"PULSE｜使用申请\n\n{request['display_name']}｜ID {target}\n"
+                "text": f"合约推送｜使用申请\n\n{request['display_name']}｜ID {target}\n"
                         + ("✅ 已批准" if approve else "❌ 已拒绝"),
             })
         if approve:
             await self._send_text(request["chat_id"],
-                                  "你的 PULSE 使用申请已通过。发送 /menu 设置独立推送条件。")
+                                  "你的合约推送使用申请已通过。发送 /menu 设置独立推送条件。")
             await self._send_shortcuts(request["chat_id"], is_admin=False)
         else:
-            await self._send_text(request["chat_id"], "你的 PULSE 使用申请未通过。")
+            await self._send_text(request["chat_id"], "你的合约推送使用申请未通过。")
 
     async def _answer_callback(self, query_id: str, text: str) -> None:
         if self._client is not None:
@@ -1201,10 +1284,10 @@ class TelegramService:
             return
         pending = self.state.pending_requests()
         if not pending:
-            await self._send_text(chat_id, "PULSE｜待审核申请\n\n当前没有待审核申请。")
+            await self._send_text(chat_id, "合约推送｜待审核申请\n\n当前没有待审核申请。")
             return
         visible = pending[:20]
-        overview = ["PULSE｜待审核申请", "", f"共 {len(pending)} 人待审核。下面每人一张独立审批卡片，处理一人不会影响其他按钮。"]
+        overview = ["合约推送｜待审核申请", "", f"共 {len(pending)} 人待审核。下面每人一张独立审批卡片，处理一人不会影响其他按钮。"]
         if len(pending) > len(visible):
             overview.append(f"本次先显示前 {len(visible)} 人；处理后再次刷新可查看其余申请。")
         await self._send_text(chat_id, "\n".join(overview))
@@ -1214,7 +1297,7 @@ class TelegramService:
             await self._client.call("sendMessage", {
                 "chat_id": chat_id,
                 "text": "\n".join([
-                    f"PULSE｜待审核申请 {index}/{len(pending)}", "",
+                    f"合约推送｜待审核申请 {index}/{len(pending)}", "",
                     f"显示名：{item['display_name']}", f"用户名：{username}",
                     f"Telegram ID：{item['user_id']}", "", "请确认身份后再批准。",
                 ]),
@@ -1226,7 +1309,7 @@ class TelegramService:
             })
 
     async def _send_menu(self, chat_id: int, prefix: str | None = None,
-                         edit_message_id: int | None = None) -> None:
+                         edit_message_id: int | None = None, page: int = 0) -> None:
         subscriber = self.state.subscriber(chat_id=chat_id)
         if not subscriber or subscriber["chat_id"] != chat_id or self._client is None:
             return
@@ -1234,7 +1317,7 @@ class TelegramService:
         if prefix:
             text = prefix + "\n\n" + text
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text,
-                                   "reply_markup": menu_keyboard(subscriber["preferences"]),
+                                   "reply_markup": menu_keyboard(subscriber["preferences"],page),
                                    "disable_web_page_preview": True}
         if edit_message_id is not None:
             payload["message_id"] = edit_message_id
@@ -1318,22 +1401,41 @@ def signal_direction(signal: dict[str, Any]) -> str | None:
 
 def signal_matches(signal: dict[str, Any], preferences: dict[str, Any]) -> tuple[bool, list[str]]:
     preferences = normalize_preferences(preferences)
+    if signal.get('rule_id')=='smc_equity_structure' and preferences['rule_settings'] is None:return False,[]
+    if preferences['rule_settings'] is not None:
+        profile=next((p for p in preferences['rule_settings'] if p['kind']==signal.get('rule_kind') and p['rule_id']==signal.get('rule_id')),None)
+        if profile is None:return False,[]
+        if profile['rule_id']=='smc_equity_structure' and not profile['symbols']:return False,[]
+        if profile['symbols'] and signal.get('symbol','').upper() not in profile['symbols']:return False,[]
+        if profile['rule_id']=='smc_equity_structure':
+            from .smc_delivery import matches
+            if not matches(signal,profile):return False,[]
+        preferences={**preferences,**profile,'event_kind':profile['kind'],'rules':[profile['rule_id']],
+            'directions':['long','short'],'require_book':False,'signal_scope':'activity','strategies':[]}
     if not preferences["signals_enabled"] or signal.get("source", "live") != "live":
         return False, []
     if signal.get("synthetic") is True or signal.get("delayed") is True:
         return False, []
     if signal.get("timeframe") not in preferences["timeframes"]:
         return False, []
+    if signal.get('rule_kind','anomaly')!=preferences['event_kind']:return False,[]
+    if preferences['event_kind']!='anomaly' and signal.get('rule_id') not in preferences['rules']:return False,[]
+    if signal.get('rule_id')=='nan_strategy1_oversold' and signal.get('signal_kind') in ('卖出平多','买回平空'):return True,['楠策略原生平仓']
+    if preferences['patterns'] and signal.get('pattern') not in preferences['patterns']:return False,[]
+    action=signal.get('actionability') or {}
+    if preferences['min_actionability']>0 and (_finite(action.get('score')) is None or action['score']<preferences['min_actionability']):return False,[]
+    if preferences['require_book'] and action.get('execution_status')!='通过':return False,[]
     if signal_direction(signal) not in preferences["directions"]:
         return False, []
     score = _finite(signal.get("activity_score"))
-    if score is None or score < preferences["min_activity"]:
+    if preferences["min_activity"]>0 and (score is None or score < preferences["min_activity"]):
         return False, []
-    if preferences["signal_scope"] == "qualified":
+    if preferences["event_kind"]=="anomaly" and preferences["signal_scope"] == "qualified":
         schema = signal.get("quality_schema_version")
         if (signal.get("qualified") is not True or not isinstance(schema, int)
                 or isinstance(schema, bool) or schema != 2):
             return False, []
+    if preferences["event_kind"]!="anomaly":return True,[]
     selected = set(preferences["strategies"])
     if not selected:
         return True, []
@@ -1345,8 +1447,40 @@ def signal_matches(signal: dict[str, Any], preferences: dict[str, Any]) -> tuple
     return accepted, [item for item in STRATEGIES if item in matches]
 
 
+def filter_description(preferences: dict[str, Any]) -> str:
+    p=normalize_preferences(preferences)
+    parts=['周期 '+(' / '.join(p['timeframes']) or '未选，不推送'),
+        '方向 '+(' / '.join('多向' if d=='long' else '空向' for d in p['directions']) or '未选，不推送'),
+        '形态 '+(' / '.join(p['patterns']) or '不限（含十字星）'),
+        f"活跃原分≥{p['min_activity']}（非百分比）",
+        f"结构分≥{p['min_actionability']:g}/100（非胜率）",
+        '盘口 '+('信号当时必须通过：价差≤0.08%、流动性分位≥40%' if p['require_book'] else '不额外过滤，保留真实检查结果')]
+    if p['event_kind']=='anomaly':
+        parts += ['保留全局两 K 异常门槛', '完整质量 '+('必须通过' if p['signal_scope']=='qualified' else '不额外过滤'),
+            '方向确认 '+((' / '.join(STRATEGY_LABELS[r] for r in p['strategies']))+'（'+('全部通过' if p['strategy_mode']=='all' else '任一通过')+'）' if p['strategies'] else '不额外过滤')]
+    else:
+        parts += [f"已选 {len(p['rules'])} 条规则，任一触发分别提示" if p['rules'] else '规则未选，不推送', '不要求两 K 异常']
+    return '筛选（各项同时满足；0 分不按该分数过滤）：'+ '；'.join(parts)
+
+
 def format_signal(signal: dict[str, Any], preferences: dict[str, Any],
                   matched_indicators: list[str] | None = None) -> str:
+    if signal.get('rule_id') == 'smc_equity_structure':
+        from .smc_delivery import format_message
+        profile=next((r for r in (preferences.get('rule_settings') or []) if r.get('rule_id')=='smc_equity_structure'),{})
+        return format_message(signal,profile,_time_text)
+    if signal.get('rule_kind') in ('indicator','quant'):
+        a=signal.get('actionability') or {}
+        action=str(signal.get('signal_kind') or '')
+        direction='多' if signal_direction(signal)=='long' else '空' if signal_direction(signal)=='short' else '未确认'
+        if '平' in action:direction=action
+        pattern=signal.get('pattern') or '无'
+        if pattern not in ('阳阳','阴阴','阳阴','阴阳'):pattern='无'
+        label='指标策略'
+        return '\n'.join([f"{signal.get('symbol')} · {signal.get('timeframe')} · {direction}",
+            f"时间：{_time_text(signal.get('close_time'))}（北京时间）",
+            f"活跃度：{_number(signal.get('activity_score'),0)} / 可做度：{_number(a.get('score'),1)}",
+            f"形态：{pattern}",f"{label}：{signal.get('rule_name')}"])
     direction = signal_direction(signal)
     candidate_direction_label = ("做多" if direction == "long" else
                                  "做空" if direction == "short" else "方向未确认")
@@ -1380,15 +1514,18 @@ def format_signal(signal: dict[str, Any], preferences: dict[str, Any],
     signal_title = ("完整强信号" if preferences.get("signal_scope") == "qualified"
                     else "强活跃异常")
     lines = [
-        f"PULSE｜{signal_title}",
+        f"合约推送｜{signal_title}",
         "",
         f"{signal.get('symbol', '未知合约')} · {signal.get('timeframe', '未知周期')} · {direction_label}",
         f"策略：{strategy_label}",
         f"形态：{signal.get('pattern') or '未知'}（{setup_label}）",
-        f"活跃度：{_number(signal.get('activity_score'), 0)}/100",
+        f"活跃度：{_number(signal.get('activity_score'), 0)}/{signal.get('score_available_max') or '未记录'}（原分）",
+        f"可操作度：{_number((signal.get('actionability') or {}).get('score'),1)} / 100（结构分，非胜率）",
+        f"盘口：{(signal.get('actionability') or {}).get('execution_status','证据不足')}",
         f"异常波动：{_number(signal.get('volatility_ratio'), 2)}×",
         "完整门槛：" + ("已通过" if gate_passed else "未通过"),
         f"收线：{_time_text(signal.get('second_candle_close_time', signal.get('close_time')))}",
+        filter_description(preferences),
     ]
     daily_count = signal.get("daily_signal_count")
     if isinstance(daily_count, int) and not isinstance(daily_count, bool) and daily_count > 0:
@@ -1447,7 +1584,7 @@ def format_signal(signal: dict[str, Any], preferences: dict[str, Any],
 def format_listing(event: dict[str, Any]) -> str:
     event_type = event.get("event_type")
     title = "新合约已开放交易" if event_type == "listed" else "发现待上架合约"
-    lines = ["PULSE｜新合约提醒", "", f"{event.get('symbol', '未知合约')} · {title}"]
+    lines = ["合约推送｜新合约提醒", "", f"{event.get('symbol', '未知合约')} · {title}"]
     if event.get("contract_type"):
         lines.append(f"合约类型：{_localized_code(event['contract_type'], CONTRACT_TYPE_LABELS)}")
     if event.get("underlying_type"):
@@ -1462,28 +1599,43 @@ def format_listing(event: dict[str, Any]) -> str:
 
 def menu_text(preferences: dict[str, Any]) -> str:
     p = normalize_preferences(preferences)
+    if p['rule_settings'] is not None:
+        return f"合约推送｜我的推送规则\n已选 {len(p['rule_settings'])} 项；点击各项独立设置周期、可做度、活跃度、形态和币种。\n仅影响你自己；每项满足自己的全部条件就推送。\n信号：{'开启' if p['signals_enabled'] else '暂停'}"
+    from .live_rule_signals import rule_catalog
+    names={r['id']:r['name'] for r in rule_catalog(p['event_kind'])}
     strategy = "空策略" if not p["strategies"] else (
         (" + " if p["strategy_mode"] == "all" else " / ").join(
             STRATEGY_LABELS[item] for item in p["strategies"]))
     return "\n".join([
-        "PULSE｜推送菜单",
+        "合约推送｜推送菜单",
         "",
+        "每位授权用户独立保存；修改仅影响你自己。",
+        "事件："+{"anomaly":"两K异常","indicator":"指标策略","quant":"指标策略"}[p["event_kind"]],
+        "形态："+(" / ".join(p["patterns"]) or "无形态"),
+        "事件规则："+((" / ".join(names[r] for r in p["rules"]) or "未选，不会推送") if p['event_kind']!='anomaly' else '两 K 异常候选'),
+        "可操作度门槛："+str(p["min_actionability"])+"；盘口通过才推："+str(p["require_book"]),
         "信号：" + ("开启" if p["signals_enabled"] else "暂停"),
-        "信号模式：" + ("完整门槛" if p["signal_scope"] == "qualified" else "活跃度筛选"),
+        filter_description(p),
         "周期：" + "、".join(p["timeframes"]),
         "方向：" + "、".join("做多" if item == "long" else "做空" for item in p["directions"]),
         f"最低活跃度：{p['min_activity']}",
-        f"策略：{strategy}",
+        (f"两 K 方向确认：{strategy}" if p['event_kind']=='anomaly' else '开平仓只按所选源码规则'),
         "新上架提醒：" + ("开启" if p["listing_enabled"] else "关闭"),
         "",
-        "点击下方按钮立即保存。多项策略命中同一事件也只推送一次。",
+        "点击下方按钮立即保存。同一用户同一事件只推送一次。",
+        "实时推送支持 5m / 15m；其他周期当前仅供图表和历史研究。发送 /menu 获取新版菜单。",
     ])
 
 
-def menu_keyboard(preferences: dict[str, Any]) -> dict[str, Any]:
+def menu_keyboard(preferences: dict[str, Any], page: int = 0) -> dict[str, Any]:
     p = normalize_preferences(preferences)
+    if p['rule_settings'] is not None:
+        from .delivery_menu import overview
+        return overview(p)
     mark = lambda active: "✅" if active else "▫️"
     rows = [
+        [{"text":"选择指标策略", "callback_data":"q:list:indicator:0"}],
+        [{"text":"全部可推周期", "callback_data":"p:tf:all"}],
         [{"text": f"{mark('5m' in p['timeframes'])} 5m", "callback_data": "p:tf:5m"},
          {"text": f"{mark('15m' in p['timeframes'])} 15m", "callback_data": "p:tf:15m"}],
         [{"text": f"{mark('long' in p['directions'])} 做多", "callback_data": "p:dir:long"},
@@ -1493,9 +1645,11 @@ def menu_keyboard(preferences: dict[str, Any]) -> dict[str, Any]:
         [{"text": f"{mark(p['signal_scope'] == 'activity')} 活跃异常", "callback_data": "p:sigmode:activity"},
          {"text": f"{mark(p['signal_scope'] == 'qualified')} 完整门槛", "callback_data": "p:sigmode:qualified"}],
         [{"text": f"{mark(not p['strategies'])} 空策略", "callback_data": "p:str:raw"},
-         {"text": f"{mark('supertrend' in p['strategies'])} 超级趋势", "callback_data": "p:str:supertrend"},
-         {"text": f"{mark('smc' in p['strategies'])} 智慧资金结构", "callback_data": "p:str:smc"}],
+         {"text": f"{mark('wt_extreme_cross' in p['strategies'])} WaveTrend 超买超卖交叉", "callback_data": "p:str:wt_extreme_cross"}],
     ]
+    if p['event_kind']!='anomaly':
+        periods=[tf for tf in TIMEFRAMES if tf not in ANOMALY_TIMEFRAMES]
+        rows[2:2]=[[dict(text=f"{mark(tf in p['timeframes'])} {tf}",callback_data=f'p:tf:{tf}') for tf in periods[i:i+3]] for i in range(0,len(periods),3)]
     if len(p["strategies"]) > 1:
         rows.append([
             {"text": f"{mark(p['strategy_mode'] == 'any')} 任一确认", "callback_data": "p:mode:any"},
@@ -1506,6 +1660,19 @@ def menu_keyboard(preferences: dict[str, Any]) -> dict[str, Any]:
          {"text": f"{mark(p['listing_enabled'])} 新上架", "callback_data": "p:list"}],
         [{"text": "刷新菜单", "callback_data": "p:refresh"}],
     ])
+    if p['event_kind']!='anomaly':
+        rows=[row for row in rows if not any(b['callback_data'].startswith(('p:str:','p:sigmode:','p:mode:')) for b in row)]
+    from .live_rule_signals import rule_catalog
+    catalogue=rule_catalog(p['event_kind']);pages=max(1,(len(catalogue)+5)//6);page=max(0,min(page,pages-1))
+    rows[0:0]=[
+        [{'text':mark(p['event_kind']==k)+v,'callback_data':'p:source:'+k} for k,v in [('anomaly','两K异常'),('indicator','指标策略')]],
+        [{'text':mark(not p['patterns'])+'无形态','callback_data':'p:pattern:none'},{'text':mark(len(p['patterns'])==4)+'全部形态','callback_data':'p:pattern:all'}],
+        [{'text':mark(v in p['patterns'])+v,'callback_data':'p:pattern:'+str(i)} for i,v in enumerate(('阳阳','阴阴','阳阴','阴阳'))],
+        [{'text':mark(p['require_book'])+'仅盘口通过','callback_data':'p:book'},{'text':'可操作度 ≥'+str(p['min_actionability'])+'（切换）','callback_data':'p:action'}]]
+    if catalogue:
+        rows.extend([[{'text':'全部规则','callback_data':'p:rules:all'},{'text':'清空规则','callback_data':'p:rules:none'}]])
+        rows.extend([[{'text':mark(r['id'] in p['rules'])+r['name'],'callback_data':'p:rule:'+r['id']}] for r in catalogue[page*6:page*6+6]])
+        rows.append([{'text':'上一页','callback_data':'p:page:'+str(max(0,page-1))},{'text':f'{page+1}/{pages} 下一页','callback_data':'p:page:'+str(min(pages-1,page+1))}])
     assert all(len(button["callback_data"].encode("utf-8")) <= MAX_CALLBACK_BYTES
                for row in rows for button in row)
     return {"inline_keyboard": rows}
@@ -1525,7 +1692,7 @@ def quick_menu_keyboard(is_admin: bool) -> dict[str, Any]:
         "resize_keyboard": True,
         "one_time_keyboard": False,
         "is_persistent": True,
-        "input_field_placeholder": "选择 PULSE 功能",
+        "input_field_placeholder": "选择合约推送功能",
     }
 
 
@@ -1547,6 +1714,8 @@ def _localized_code(value: Any, labels: dict[str, str]) -> str:
 
 
 def _parse_command(text: str) -> tuple[str | None, str | None]:
+    coins=re.fullmatch(r'/coins(?:@[A-Za-z0-9_]+)?\s+([^\r\n]{1,3900})',text.strip(),re.I)
+    if coins:return 'coins',coins.group(1)
     match = re.match(r"^/([A-Za-z]+)(?:@[A-Za-z0-9_]+)?(?:\s+([^\s]{1,80}))?\s*$", text[:200])
     return (match.group(1).lower(), match.group(2)) if match else (None, None)
 

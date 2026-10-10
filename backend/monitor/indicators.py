@@ -16,44 +16,13 @@ from statistics import fmean
 from typing import Any
 
 from .engine import Candle, TIMEFRAME_MS, _valid_prices, _valid_volume
+from .actionability import assess as assess_actionability
+from .shortlist import ITEMS as SHORTLIST, IDS as SHORTLIST_IDS
+from .community_indicators import states as community_states
 
 
-_CATALOG = (
-    {
-        "id": "supertrend", "name": "超级趋势",
-        "description": "HL2 ± ATR 追踪线；趋势同向，反转要求近期翻转。",
-        "parameters": ["atr_period", "atr_multiplier", "atr_method"],
-        "formula": "用户提供的 Pine v4 Supertrend 公式",
-        "defaults": {"source": "HL2（最高价与最低价的平均值）", "atr_period": 10, "atr_multiplier": 3.0, "atr_method": "Wilder RMA"},
-        "visual_layers": [
-            {"id": "supertrend", "name": "超级趋势线", "default_visible": True},
-            {"id": "flips", "name": "趋势翻转标记", "default_visible": True},
-            {"id": "supertrend_highlight", "name": "趋势背景高亮", "default_visible": False},
-        ],
-    },
-    {
-        "id": "smc", "name": "SMC 市场结构",
-        "description": "确认后的内部/摆动结构、BOS/CHoCH、支撑阻力、订单块、等高低与 FVG。",
-        "parameters": ["smc_internal_length", "smc_swing_length", "structure_max_age"],
-        "visual_layers": [
-            {"id": "events", "name": "结构突破与趋势变化", "default_visible": True},
-            {"id": "order_blocks", "name": "订单块", "default_visible": True},
-            {"id": "equal_levels", "name": "等高点与等低点", "default_visible": True},
-            {"id": "strong_weak", "name": "强弱高低点", "default_visible": True},
-            {"id": "fvgs", "name": "公允价值缺口", "default_visible": False},
-            {"id": "zone_bounds", "name": "溢价、均衡与折价区", "default_visible": False},
-        ],
-        "glossary": {
-            "BOS": "结构突破", "CHoCH": "趋势变化", "EQH": "等高点", "EQL": "等低点",
-            "OB": "订单块", "FVG": "公允价值缺口", "Premium": "溢价区",
-            "Equilibrium": "均衡区", "Discount": "折价区",
-        },
-        "attribution": "Adapted from Smart Money Concepts [LuxAlgo] © LuxAlgo",
-        "license": "CC BY-NC-SA 4.0", "license_url": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
-        "license_scope": "仅限非商业使用；改编与再发布须署名并采用相同许可",
-    },
-    {"id": "ema", "name": "EMA 双均线", "description": "EMA20/50 方向确认；反转要求近期交叉。", "parameters": ["ema_fast_period", "ema_slow_period"]},
-)
+from .community_indicators import CATALOG
+_CATALOG = tuple(CATALOG)
 
 
 def indicator_catalog() -> list[dict[str, Any]]:
@@ -74,7 +43,7 @@ def _number(value: Any, name: str, minimum: float, maximum: float) -> float:
 
 @dataclass
 class IndicatorConfig:
-    enabled_indicators: tuple[str, ...] = ("supertrend", "smc")
+    enabled_indicators: tuple[str, ...] = ("wt_extreme_cross",)
     confirmation_mode: str = "all"
     atr_period: int = 10
     atr_multiplier: float = 3.0
@@ -186,7 +155,7 @@ def _atr(candles: list[Candle], period: int, method: str = "wilder") -> list[flo
     return result
 
 
-def _supertrend(candles: list[Candle], config: IndicatorConfig, atrs: list[float | None]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _supertrend(candles: list[Candle], config: IndicatorConfig, atrs: list[float | None], *, full: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     previous_up = previous_down = None
     direction = "up"
     flip_time = None
@@ -229,10 +198,10 @@ def _supertrend(candles: list[Candle], config: IndicatorConfig, atrs: list[float
             "formula": "Pine v4 Supertrend（用户提供公式）",
         }
         previous_up, previous_down = up, down
-    return current, points[-300:]
+    return current, points if full else points[-300:]
 
 
-def _ema(candles: list[Candle], config: IndicatorConfig) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+def _ema(candles: list[Candle], config: IndicatorConfig, *, full: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     fast = slow = None
     previous_direction = "neutral"
     cross_time = None
@@ -250,7 +219,7 @@ def _ema(candles: list[Candle], config: IndicatorConfig) -> tuple[dict[str, Any]
         if i + 1 >= config.ema_slow_period:
             slow_points.append({"time": candle.open_time, "value": slow})
     ready = len(candles) >= config.ema_slow_period
-    return {"ready": ready, "direction": previous_direction if ready else "neutral", "fast": fast if ready else None, "slow": slow if ready else None, "cross_time": cross_time if ready else None}, fast_points[-300:], slow_points[-300:]
+    return {"ready": ready, "direction": previous_direction if ready else "neutral", "fast": fast if ready else None, "slow": slow if ready else None, "cross_time": cross_time if ready else None}, fast_points if full else fast_points[-300:], slow_points if full else slow_points[-300:]
 
 
 def _smc(candles: list[Candle], config: IndicatorConfig) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -676,9 +645,6 @@ def indicator_context(candles: list[Candle], config: IndicatorConfig | None = No
     ema, fast_points, slow_points = _ema(candles, config)
     smc, levels = _smc(candles, config)
     warnings = []
-    for name in config.enabled_indicators:
-        if not {"supertrend": supertrend, "ema": ema, "smc": smc}[name]["ready"]:
-            warnings.append(f"{next(item['name'] for item in _CATALOG if item['id'] == name)} 历史或确认点不足")
     if len(candles) < 200:
         warnings.append("SMC ATR200 尚未就绪：等高低确认未启用，订单块未使用 ATR200 波动过滤")
     if not config.enabled_indicators:
@@ -709,7 +675,12 @@ def indicator_context(candles: list[Candle], config: IndicatorConfig | None = No
         "pivot_time": level["pivot_time"], "previous_pivot_time": level["previous_pivot_time"],
         "confirmed_at": level["confirmed_at"], "extend_right": True,
     } for level in smc["equal_levels"]]
-    return {"status": "ready", "available_history": len(candles), "supertrend": supertrend, "smc": smc, "ema": ema,
+    from .shortcut_rules import selected as shortcut_selected, quant_states
+    chosen=shortcut_selected()
+    selected_ids={item['id'] for item in chosen}
+    shortlisted=community_states(candles,selected_ids)[-1] if selected_ids else {}
+    shortlisted.update(quant_states(candles,config,chosen))
+    return {"status": "ready", "available_history": len(candles), "supertrend": supertrend, "smc": smc, "ema": ema,"shortlist":shortlisted,
             "chart": {"supertrend": trend_points, "flips": flips, "ema_fast": fast_points, "ema_slow": slow_points,
                       "levels": levels, "events": events[-300:], "order_blocks": order_blocks[-100:],
                       "fvgs": fvgs[-100:], "equal_levels": equal_levels[-100:],
@@ -728,32 +699,12 @@ def _recent(timestamp: int | None, now: int, interval: int, age: int) -> bool:
     return timestamp is not None and 0 <= now - timestamp <= age * interval
 
 
-def _confirmation(name: str, context: dict[str, Any], direction: str, reversal: bool, now: int, interval: int, config: IndicatorConfig) -> dict[str, Any]:
-    data = context[name]
-    label = next(item["name"] for item in _CATALOG if item["id"] == name)
-    passed = data["ready"] and data["direction"] == direction
-    reason = "方向一致" if passed else "尚未就绪或方向不一致"
-    if passed and reversal:
-        if name == "supertrend":
-            passed = _recent(data["flip_time"], now, interval, config.structure_max_age)
-            reason = "近期超级趋势翻转" if passed else "缺少近期超级趋势翻转"
-        elif name == "ema":
-            passed = _recent(data["cross_time"], now, interval, config.structure_max_age)
-            reason = "近期 EMA 交叉" if passed else "缺少近期 EMA 交叉"
-        else:
-            passed = any(event["event"] == "CHoCH" and event["direction"] == direction and _recent(event["time"], now, interval, config.structure_max_age) for event in data["events"])
-            reason = "近期已确认 CHoCH" if passed else "缺少近期已确认 CHoCH"
-    elif passed and name == "smc":
-        passed = any(event["event"] == "BOS" and event["direction"] == direction for event in data["events"])
-        reason = "已有同向 BOS 且当前结构同向" if passed else "同向结构尚无 BOS 确认"
-    if name == "smc":
-        position = _directional_position(data.get("position_assessment"), direction)
-        if position["blocked"]:
-            passed = False
-            reason = f"{position['label']}：{position['advice']}；{position['reason']}"
-        elif passed:
-            reason += f"；{position['label']}，{position['advice']}"
-    return {"id": name, "name": label, "passed": bool(passed), "reason": reason}
+def _confirmation(name, context, direction, reversal, now, interval, config):
+    if name not in {r['id'] for r in CATALOG}:
+        raise ValueError('指标策略已移除')
+    state=context.get('shortlist',{}).get(name)
+    return dict(id=name,name=next(r['name'] for r in CATALOG if r['id']==name),passed=state==direction,
+        ready=state is not None,reason='同根收盘超买超卖交叉' if state==direction else '尚未触发或历史不足')
 
 
 def _directional_position(position: dict[str, Any] | None, direction: str) -> dict[str, Any]:
@@ -922,7 +873,7 @@ def _evaluate_with_context(signal: dict[str, Any], candles: list[Candle], config
     # enabled subset below is allowed to affect formal qualification.
     available_confirmations = [
         _confirmation(name, context, direction, reversal, last.close_time, TIMEFRAME_MS[last.timeframe], config)
-        for name in ("supertrend", "smc", "ema")
+        for name in (r["id"] for r in CATALOG)
     ]
     result["available_confirmations"] = available_confirmations
     by_name = {item["id"]: item for item in available_confirmations}
@@ -940,4 +891,5 @@ def _evaluate_with_context(signal: dict[str, Any], candles: list[Candle], config
         if plan["net_potential_pct"] < rules["min_net_move_pct"]:
             reasons.append("最近已确认目标位的成本后空间不足")
     result["qualified"] = not reasons
+    result["actionability"] = assess_actionability(signal, candles, context, plan, position)
     return result

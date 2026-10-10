@@ -17,7 +17,7 @@ function Write-Result($Value) {
         $Value | ConvertTo-Json -Depth 8 -Compress
     }
     else {
-        if ($Value.message) { Write-Host ('[PULSE] {0}' -f $Value.message) -ForegroundColor Cyan }
+        if ($Value.message) { Write-Host ('[合约推送] {0}' -f $Value.message) -ForegroundColor Cyan }
         $Value | Format-List | Out-Host
     }
 }

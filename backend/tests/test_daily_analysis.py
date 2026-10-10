@@ -51,33 +51,15 @@ class DailyAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(full["oi_change_pct"], sliced["oi_change_pct"])
         self.assertAlmostEqual(full["oi_ratio"], sliced["oi_ratio"])
 
-    def test_method_flags_require_each_production_confirmation(self):
-        config = IndicatorConfig()
-        close_time = 100 * TIMEFRAME_MS["5m"] - 1
-        context = {
-            "status": "ready",
-            "supertrend": {"ready": True, "direction": "up",
-                           "flip_time": close_time},
-            "smc": {"ready": True, "direction": "up",
-                    "events": [{"event": "BOS", "direction": "up",
-                                "time": close_time}],
-                    "position_assessment": {
-                        "code": "breakout_up_held", "label": "向上突破已站稳",
-                        "reason": "连续3根已收盘K线确认突破", "assessed_at": close_time,
-                        "uses_closed_bars_only": True, "breakout_confirmed": True,
-                        "long_allowed": True, "short_allowed": False,
-                        "long_advice": "突破站稳，可观察顺势做多",
-                        "short_advice": "不宜逆势做空",
-                    }},
-        }
-        flags, _ = _method_flags(context, config, "阳阳", close_time, "5m", True)
-        self.assertEqual(flags, {"two_bar": True, "supertrend": True,
-                                 "smc": True, "supertrend_smc": True})
-        context["smc"] = {"ready": True, "direction": "down", "events": []}
-        flags, _ = _method_flags(context, config, "阳阳", close_time, "5m", True)
-        self.assertTrue(flags["supertrend"])
-        self.assertFalse(flags["smc"])
-        self.assertFalse(flags["supertrend_smc"])
+    def test_method_flags_require_wavetrend_confirmation(self):
+        from monitor.daily_analysis import _method_flags
+        from monitor.indicators import IndicatorConfig
+        context={'status':'ready','shortlist':{'wt_extreme_cross':'up'}}
+        flags,_=_method_flags(context,IndicatorConfig(),'阳阳',100,'5m',True)
+        self.assertEqual(flags,{'two_bar':True,'wt_extreme_cross':True})
+        context['shortlist']['wt_extreme_cross']='neutral'
+        flags,_=_method_flags(context,IndicatorConfig(),'阳阳',100,'5m',True)
+        self.assertFalse(flags['wt_extreme_cross'])
 
     def test_oi_reconstruction_fails_closed_without_matched_samples(self):
         self.assertEqual(reconstruct_oi([], "5m", 10_000), {

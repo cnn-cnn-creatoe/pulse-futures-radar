@@ -1,4 +1,5 @@
 'use client';
+import { WorkspaceTabs } from './workspace-tabs';
 import { useEffect, useState } from 'react';
 import {
   Bell,
@@ -9,22 +10,13 @@ import {
   ShieldCheck,
   Upload,
   Download,
-  Plus,
-  Copy,
-  Code2,
-  Save,
   Activity,
   AlertTriangle,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from '@/components/ui/dialog';
+
 import {
   CATEGORIES,
   categoryLabel,
@@ -65,7 +57,7 @@ export type AdvancedSettings = {
 export const ADVANCED_DEFAULTS: AdvancedSettings = {
   threshold_profile: 'timeframe',
   indicators: {
-    enabled_indicators: ['supertrend', 'smc'],
+    enabled_indicators: ['wt_extreme_cross'],
     confirmation_mode: 'all',
     atr_period: 10,
     atr_multiplier: 3,
@@ -375,175 +367,12 @@ function Numeric({
 export function IndicatorSettingsPanel({
   value,
   onChange,
-  api,
-  online,
 }: {
   value: AdvancedSettings;
   onChange: (s: AdvancedSettings) => void;
   api?: string | null;
   online?: boolean;
 }) {
-  const [showExtra, setShowExtra] = useState(
-    value.indicators.enabled_indicators.includes('ema'),
-  );
-  type CustomIndicator = {
-    id: string;
-    name: string;
-    description: string;
-    long_expression: string;
-    short_expression: string;
-    status?: 'draft' | 'validated';
-    required_history?: number | null;
-    validation?: { valid?: boolean; errors?: { field: string; message: string }[] };
-    updated_at?: string;
-  };
-  const emptyCustom: CustomIndicator = {
-    id: 'rsi_momentum',
-    name: 'RSI 动量确认',
-    description: '价格位于 EMA20 同侧时，用 RSI14 确认多空动量。',
-    long_expression: 'rsi(14) > 55 and close > ema(20)',
-    short_expression: 'rsi(14) < 45 and close < ema(20)',
-  };
-  const [customItems, setCustomItems] = useState<CustomIndicator[]>([]);
-  const [custom, setCustom] = useState<CustomIndicator>(emptyCustom);
-  const [editorOpen, setEditorOpen] = useState(false);
-  const [editorBusy, setEditorBusy] = useState(false);
-  const [editorMessage, setEditorMessage] = useState('');
-  const [validation, setValidation] = useState<{
-    valid: boolean;
-    required_history?: number | null;
-    errors?: { field: string; message: string }[];
-  } | null>(null);
-  const reloadCustom = async () => {
-    if (!api || !online) return;
-    const response = await fetch(api + '/api/custom-indicators', {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!response.ok) throw Error('无法读取自定义指标库');
-    const data = (await response.json()) as { items?: CustomIndicator[] };
-    setCustomItems(data.items || []);
-  };
-  useEffect(() => {
-    if (!api || !online) return;
-    let cancelled = false;
-    fetch(api + '/api/custom-indicators', {
-      signal: AbortSignal.timeout(5000),
-    })
-      .then((response) => {
-        if (!response.ok) throw Error();
-        return response.json() as Promise<{ items?: CustomIndicator[] }>;
-      })
-      .then((data) => {
-        if (!cancelled) setCustomItems(data.items || []);
-      })
-      .catch(() => {
-        if (!cancelled) setCustomItems([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [api, online]);
-  const editorError = (data: unknown) => {
-    if (!data || typeof data !== 'object') return '操作失败，请检查表达式。';
-    const detail = (data as { detail?: unknown }).detail;
-    if (typeof detail === 'string') return detail;
-    const errors =
-      detail && typeof detail === 'object'
-        ? (detail as { errors?: { field?: string; message?: string }[] }).errors
-        : undefined;
-    return errors?.length
-      ? errors.map((item) => `${item.field || '代码'}：${item.message || '无效'}`).join('；')
-      : '操作失败，请检查名称、ID 与表达式。';
-  };
-  const validateCustom = async () => {
-    if (!api) return null;
-    setEditorBusy(true);
-    setEditorMessage('');
-    try {
-      const response = await fetch(api + '/api/custom-indicators/validate', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Pulse-Client': 'dashboard',
-        },
-        body: JSON.stringify({
-          id: custom.id,
-          name: custom.name,
-          description: custom.description,
-          long_expression: custom.long_expression,
-          short_expression: custom.short_expression,
-        }),
-      });
-      const data = (await response.json()) as {
-        valid?: boolean;
-        required_history?: number | null;
-        errors?: { field: string; message: string }[];
-      };
-      if (!response.ok) throw Error(editorError({ detail: data }));
-      const report = {
-        valid: data.valid === true,
-        required_history: data.required_history,
-        errors: data.errors || [],
-      };
-      setValidation(report);
-      setEditorMessage(
-        report.valid
-          ? `安全校验通过，至少需要 ${report.required_history || 1} 根已收盘 K 线。`
-          : (report.errors || [])
-              .map((item) => `${item.field}：${item.message}`)
-              .join('；'),
-      );
-      return report;
-    } catch (error) {
-      setValidation({ valid: false });
-      setEditorMessage((error as Error).message);
-      return null;
-    } finally {
-      setEditorBusy(false);
-    }
-  };
-  const saveCustom = async (status: 'draft' | 'validated') => {
-    if (!api) return;
-    setEditorBusy(true);
-    setEditorMessage('');
-    try {
-      const response = await fetch(api + '/api/custom-indicators', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Pulse-Client': 'dashboard',
-        },
-        body: JSON.stringify({
-          id: custom.id,
-          name: custom.name,
-          description: custom.description,
-          long_expression: custom.long_expression,
-          short_expression: custom.short_expression,
-          status,
-        }),
-      });
-      const data = (await response.json()) as {
-        message?: string;
-        detail?: unknown;
-      };
-      if (!response.ok) throw Error(editorError(data));
-      setEditorMessage(data.message || '已保存。');
-      setValidation((previous) =>
-        status === 'validated'
-          ? {
-              valid: true,
-              required_history: previous?.required_history,
-              errors: [],
-            }
-          : previous,
-      );
-      await reloadCustom();
-    } catch (error) {
-      setEditorMessage((error as Error).message);
-    } finally {
-      setEditorBusy(false);
-    }
-  };
   const i = value.indicators,
     q = value.quality;
   const setI = (patch: Partial<typeof i>) =>
@@ -558,6 +387,7 @@ export function IndicatorSettingsPanel({
   };
   return (
     <>
+      <WorkspaceTabs labels={['指标选择与参数','强信号门槛']}>
       <section className="panel advanced-panel">
         <div className="panel-heading">
           <h2>
@@ -572,8 +402,7 @@ export function IndicatorSettingsPanel({
         </div>
         <div className="form-body">
           <p className="section-intro">
-            指标不参与活跃度打分。可以选择空策略、一个指标或多个指标；阳阳 / 阴阴检查趋势，阴阳
-            / 阳阴检查最近的方向切换。
+            指标策略与活跃度独立计算。可不选规则，或使用 WaveTrend 同根、同方向的超买超卖交叉确认。
           </p>
           <div className="indicator-picker">
             <button
@@ -594,169 +423,11 @@ export function IndicatorSettingsPanel({
                 <small>不要求指标共振 · 候选更多</small>
               </span>
             </button>
-            {[
-              ['supertrend', '超级趋势', '平均真实波幅趋势方向与翻转'],
-              ['smc', '智慧资金市场结构（SMC）', '结构突破 / 结构转折 · 支撑与阻力'],
-              ...(showExtra || i.enabled_indicators.includes('ema')
-                ? [['ema', '指数移动平均双线（EMA）', '可扩展指标 · 快慢线确认']]
-                : []),
-            ].map(([id, name, desc]) => (
-              <button
-                type="button"
-                key={id}
-                title={
-                  id === 'supertrend'
-                    ? '用 ATR 适应不同币种的波动，判断当前趋势方向；趋势形态要求同向，反转形态要求近期发生方向翻转。'
-                    : id === 'smc'
-                      ? '只使用当时已经确认的结构突破、结构转折、摆动高低点与支撑阻力；用于检查结构方向、止损位置和目标空间。'
-                      : '比较指数移动平均快线与慢线方向；趋势形态要求同向，反转形态要求近期交叉。它反应较慢，适合作为辅助确认。'
-                }
-                className={
-                  'indicator-option ' +
-                  (i.enabled_indicators.includes(id) ? 'active' : '')
-                }
-                onClick={() => toggle(id)}
-                aria-pressed={i.enabled_indicators.includes(id)}
-              >
-                <span className="indicator-check">
-                  {i.enabled_indicators.includes(id) && <Check size={14} />}
-                </span>
-                <span>
-                  <b>{name}</b>
-                  <small>{desc}</small>
-                </span>
-              </button>
-            ))}
-          </div>
-          {!showExtra && !i.enabled_indicators.includes('ema') && (
-            <Button
-              variant="outline"
-              onClick={() => {
-                setShowExtra(true);
-                setI({ enabled_indicators: [...i.enabled_indicators, 'ema'] });
-              }}
-            >
-              <Plus size={15} />
-              添加指标：指数移动平均双线
-            </Button>
-          )}
-          <div className="custom-indicator-actions">
-            <Button
-              variant="outline"
-              disabled={!api || !online}
-              title="打开安全表达式编辑器；保存的代码不会直接执行或自动进入实时信号。"
-              onClick={() => {
-                setCustom(emptyCustom);
-                setValidation(null);
-                setEditorMessage('');
-                setEditorOpen(true);
-              }}
-            >
-              <Plus size={15} />
-              新建自定义指标
-            </Button>
-            <small>点击加号编写规则；先安全校验、再单项回测，才考虑接入强筛。</small>
-          </div>
-          {!!customItems.length && (
-            <div className="custom-indicator-library">
-              <div className="library-heading">
-                <b>自定义指标库</b>
-                <small>{customItems.length} 个本地指标</small>
-              </div>
-              {customItems.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => {
-                    setCustom(item);
-                    setValidation(
-                      item.validation
-                        ? {
-                            valid: item.validation.valid === true,
-                            required_history: item.required_history,
-                            errors: item.validation.errors,
-                          }
-                        : null,
-                    );
-                    setEditorMessage('');
-                    setEditorOpen(true);
-                  }}
-                >
-                  <Code2 size={16} />
-                  <span>
-                    <b>{item.name}</b>
-                    <small>{item.id}</small>
-                  </span>
-                  <em className={item.status === 'validated' ? 'validated' : ''}>
-                    {item.status === 'validated' ? '已校验 · 待回测' : '草稿 · 不执行'}
-                  </em>
-                </button>
-              ))}
-            </div>
-          )}
-          <label className="field">
-            <span title="全部通过会减少信号但条件更严格；至少一个通过会增加候选，仍需成交额、流动性、支撑阻力和风险收益门槛。">
-              组合方式
-            </span>
-            <select
-              className="native-select"
-              title="决定多个已选指标如何共同确认；不会跳过其他强信号门槛。"
-              value={i.confirmation_mode}
-              disabled={i.enabled_indicators.length < 2}
-              onChange={(e) =>
-                setI({ confirmation_mode: e.target.value as 'all' | 'any' })
-              }
-            >
-              <option value="all">全部所选指标通过（更严格）</option>
-              <option value="any">至少一个所选指标通过</option>
-            </select>
-            <p>
-              {i.enabled_indicators.length < 2
-                ? '选择两个或更多指标后，才需要设置组合方式。空策略仍会执行强度、流动性、支撑阻力空间和成本门槛。'
-                : '无论组合方式如何，强度、流动性、支撑阻力空间和成本门槛仍须通过。'}
-            </p>
-          </label>
+            {[['wt_extreme_cross','WaveTrend · 超买超卖交叉','WT1低于-53金叉／高于53死叉，收盘确认'],['nan_strategy1_oversold','楠策略1超买超卖','WT极值转折入场，相反转折平仓']].map(([id,name,desc])=><button type="button" key={id} className={'indicator-option '+(i.enabled_indicators.includes(id)?'active':'')} onClick={()=>toggle(id)} aria-pressed={i.enabled_indicators.includes(id)}><span><b>{name}</b><small>{desc}</small></span></button>)}
+          </div><p className="field-help">指标策略统一在研究库中选择；每项活跃度与可做度在该项“设置”中配置。这里控制两K异常的确认条件。</p>
           <div className="settings-group">
             <h3>
-              超级趋势 <small>对应你提供的 Pine 参数</small>
-            </h3>
-            <div className="field-grid">
-              <Numeric
-                label="平均真实波幅周期（ATR）"
-                hint="计算真实波幅的回看根数；越小越敏感，越大越平滑。"
-                value={i.atr_period}
-                min={2}
-                max={100}
-                step={1}
-                onChange={(v) => setI({ atr_period: v })}
-              />
-              <Numeric
-                label="平均真实波幅倍数"
-                hint="趋势线离价格的距离；越小越敏感也越容易出现假翻转，越大越稳但更慢。"
-                value={i.atr_multiplier}
-                min={0.5}
-                max={10}
-                onChange={(v) => setI({ atr_multiplier: v })}
-              />
-            </div>
-            <label className="field" htmlFor="custom-indicator-id">
-              <span>平均真实波幅算法</span>
-              <select
-                className="native-select"
-                title="Wilder RMA 对应常用 ATR；SMA 是你原脚本中可切换的简单平均算法。"
-                value={i.atr_method}
-                onChange={(e) =>
-                  setI({ atr_method: e.target.value as 'wilder' | 'sma' })
-                }
-              >
-                <option value="wilder">Wilder RMA（原脚本默认）</option>
-                <option value="sma">TR 简单移动平均</option>
-              </select>
-            </label>
-          </div>
-          <div className="settings-group">
-            <h3>
-              智慧资金市场结构（SMC） <small>只使用已确认结构</small>
+              可做度基础计算 <small>支撑阻力与已确认结构</small>
             </h3>
             <div className="field-grid">
               <Numeric
@@ -793,51 +464,6 @@ export function IndicatorSettingsPanel({
               全部绘图功能的逐像素复刻。
             </p>
           </div>
-          {(showExtra || i.enabled_indicators.includes('ema')) && (
-            <div className="settings-group">
-              <h3>指数移动平均双线（EMA）</h3>
-              <div className="field-grid">
-                <Numeric
-                  label="快线周期"
-                  hint="指数移动平均快线回看长度；越小越贴近当前价格。"
-                  value={i.ema_fast_period}
-                  min={2}
-                  max={100}
-                  step={1}
-                  onChange={(v) => setI({ ema_fast_period: v })}
-                />
-                <Numeric
-                  label="慢线周期"
-                  hint="指数移动平均慢线回看长度；必须大于快线，用于判断较慢趋势。"
-                  value={i.ema_slow_period}
-                  min={3}
-                  max={300}
-                  step={1}
-                  onChange={(v) => setI({ ema_slow_period: v })}
-                />
-              </div>
-            </div>
-          )}
-          <p className="field-help">
-            更多指标可通过本地指标注册接口扩展；看板不直接执行粘贴的脚本。SMC
-            改编自 © LuxAlgo，CC BY-NC-SA 4.0，仅限非商业用途并保留同许可。{' '}
-            <a
-              href="/licenses/SMC-ADAPTATION.md"
-              target="_blank"
-              rel="noreferrer"
-              className="up"
-            >
-              改编说明
-            </a>{' '}
-            ·{' '}
-            <a
-              href="/licenses/smc-adaptation-source.py"
-              download
-              className="up"
-            >
-              改编源码
-            </a>
-          </p>
         </div>
       </section>
       <section className="panel advanced-panel">
@@ -942,134 +568,8 @@ export function IndicatorSettingsPanel({
           </div>
         </div>
       </section>
-      <Dialog open={editorOpen} onOpenChange={setEditorOpen}>
-        <DialogContent className="indicator-editor-dialog">
-          <DialogTitle>自定义指标代码编辑器</DialogTitle>
-          <DialogDescription>
-            使用受限表达式编写做多与做空条件。网页不会执行 Pine、Python 或 JavaScript；所有规则只读取当前及之前已收盘的连续 K 线。
-          </DialogDescription>
-          <div className="editor-toolbar">
-            <span>支持：open / high / low / close / volume</span>
-            <span>sma · ema · rsi · atr · highest · lowest</span>
-          </div>
-          <div className="field-grid">
-            <label className="field">
-              <span>指标 ID</span>
-              <Input
-                id="custom-indicator-id"
-                value={custom.id}
-                onChange={(event) => {
-                  setCustom({ ...custom, id: event.target.value.toLowerCase() });
-                  setValidation(null);
-                }}
-                placeholder="rsi_momentum"
-              />
-              <p>小写字母开头，只用小写字母、数字和下划线。</p>
-            </label>
-            <label className="field" htmlFor="custom-indicator-name">
-              <span>显示名称</span>
-              <Input
-                id="custom-indicator-name"
-                value={custom.name}
-                onChange={(event) => setCustom({ ...custom, name: event.target.value })}
-                placeholder="RSI 动量确认"
-              />
-            </label>
-          </div>
-          <label className="field" htmlFor="custom-indicator-description">
-            <span>用途说明</span>
-            <Input
-              id="custom-indicator-description"
-              value={custom.description}
-              onChange={(event) =>
-                setCustom({ ...custom, description: event.target.value })
-              }
-            />
-          </label>
-          <label className="field code-field" htmlFor="custom-indicator-long">
-            <span>做多条件 LONG</span>
-            <textarea
-              id="custom-indicator-long"
-              value={custom.long_expression}
-              onChange={(event) => {
-                setCustom({ ...custom, long_expression: event.target.value });
-                setValidation(null);
-              }}
-              spellCheck={false}
-              placeholder="rsi(14) > 55 and close > ema(20)"
-            />
-          </label>
-          <label className="field code-field" htmlFor="custom-indicator-short">
-            <span>做空条件 SHORT</span>
-            <textarea
-              id="custom-indicator-short"
-              value={custom.short_expression}
-              onChange={(event) => {
-                setCustom({ ...custom, short_expression: event.target.value });
-                setValidation(null);
-              }}
-              spellCheck={false}
-              placeholder="rsi(14) < 45 and close < ema(20)"
-            />
-          </label>
-          <div
-            className={
-              'editor-validation ' +
-              (validation?.valid ? 'pass' : validation ? 'fail' : '')
-            }
-          >
-            <ShieldCheck size={17} />
-            <span>
-              {editorMessage ||
-                '尚未校验。草稿可以保存，但不会运行；“校验并保存”只确认安全与因果性，不代表胜率高。'}
-            </span>
-          </div>
-          <div className="editor-buttons">
-            <Button
-              variant="ghost"
-              onClick={async () => {
-                try {
-                  await navigator.clipboard.writeText(
-                    `LONG = ${custom.long_expression}\nSHORT = ${custom.short_expression}`,
-                  );
-                  setEditorMessage('当前模板已复制到剪贴板。');
-                } catch {
-                  setEditorMessage('浏览器未允许复制，请手动选择代码。');
-                }
-              }}
-            >
-              <Copy size={15} />
-              复制模板
-            </Button>
-            <Button
-              variant="outline"
-              disabled={editorBusy}
-              onClick={() => void validateCustom()}
-            >
-              <Code2 size={15} />
-              验证代码
-            </Button>
-            <Button
-              variant="outline"
-              disabled={editorBusy || !api || !online}
-              onClick={() => void saveCustom('draft')}
-            >
-              <Save size={15} />
-              保存草稿
-            </Button>
-            <Button
-              disabled={editorBusy || !api || !online}
-              onClick={() => void saveCustom('validated')}
-            >
-              <ShieldCheck size={15} />
-              校验并保存
-            </Button>
-          </div>
-          <p className="editor-safety-note">
-            保存后状态为“待回测”，不会自动加入实时指标。这样可避免未经样本外验证的新规则直接生成做多或做空提示。
-          </p>
-        </DialogContent>
-      </Dialog>
+      </WorkspaceTabs>
+
     </>
   );
 }
@@ -1359,7 +859,7 @@ export function UniversePanel({
       quoteOf(u) === 'USDT',
   );
   return (
-    <div className="research-layout">
+    <WorkspaceTabs labels={['上线提醒','合约覆盖']}>
       <section className="panel">
         <div className="panel-heading">
           <h2>
@@ -1518,7 +1018,7 @@ export function UniversePanel({
           )}
         </div>
       </section>
-    </div>
+    </WorkspaceTabs>
   );
 }
 
@@ -1789,7 +1289,7 @@ export function BacktestPanel({
     );
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'PULSE-历史回测-' + (report.policy_hash || '报告') + '.json';
+    a.download = '合约推送-历史回测-' + (report.policy_hash || '报告') + '.json';
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
@@ -1806,7 +1306,7 @@ export function BacktestPanel({
       'entry-events': '双向入场点',
       'entry-summary': '双向胜率汇总',
     } as const;
-    a.download = `PULSE-历史回测-${labels[kind]}.csv`;
+    a.download = `合约推送-历史回测-${labels[kind]}.csv`;
     a.click();
   }
   return (

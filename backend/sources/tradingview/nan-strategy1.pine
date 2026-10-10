@@ -1,0 +1,185 @@
+//@version=6
+indicator("WaveTrend B · 回退排查版", shorttitle="WT-B 回退", overlay=true, max_lines_count=500, max_labels_count=200, behind_chart=false)
+
+// WaveTrend 原始算法作者：LazyBear
+// 回退B版：保留WT1转折、WT1/WT2相对位置和原平仓逻辑。
+// 不含B+的支撑阻力、结构突破、空间或追价过滤。
+// 相比原B版：区域去重默认关闭；横线改绿/红/灰；增加可选诊断。
+// 当前图表周期独立计算，不读取其他周期，不含自动下单或提醒。
+// 信号画在检测到转折的当前K线，不回填到上一根极值K线。
+// 默认盘中预览：未收盘信号可以变化或消失，不是固定成交记录。
+
+// ───── 1. WaveTrend 参数 ─────
+n1 = input.int(10, "通道长度", minval=1, group="WaveTrend")
+n2 = input.int(21, "平均长度", minval=1, group="WaveTrend")
+obLevel1 = input.float(60.0, "超买阈值1", minval=0, group="WaveTrend")
+obLevel2 = input.float(53.0, "超买阈值2", minval=0, group="WaveTrend")
+osLevel1 = input.float(-60.0, "超卖阈值1", maxval=0, group="WaveTrend")
+osLevel2 = input.float(-53.0, "超卖阈值2", maxval=0, group="WaveTrend")
+useLevel2 = input.bool(true, "使用阈值2（默认53/-53）", group="WaveTrend")
+
+obLevel = useLevel2 ? obLevel2 : obLevel1
+osLevel = useLevel2 ? osLevel2 : osLevel1
+
+if barstate.isfirst and obLevel <= osLevel
+    runtime.error("超买阈值必须大于超卖阈值。")
+
+// ───── 2. 信号设置 ─────
+confirmClose = input.bool(false, "仅在K线收盘时确认信号", group="信号设置", tooltip="关闭：盘中预览，信号和彩色短线可能变化或消失。开启：仅显示收盘仍成立的信号。")
+onePerZone = input.bool(false, "同一连续超买/超卖区段最多开仓一次", group="信号设置", tooltip="默认关闭：平仓后，新的合格WT转折可再次开仓，不必离开超买/超卖区。开启恢复原B版区域限制。仍不重复加仓。")
+
+// ───── 3. 显示设置 ─────
+showEntries = input.bool(true, "显示做多/做空箭头", group="显示")
+showExits = input.bool(true, "显示灰色平仓箭头及文字", group="显示")
+showLines = input.bool(true, "显示绿/红/灰参考价短横线", group="显示")
+
+longColor = input.color(color.lime, "做多箭头与横线颜色", group="显示")
+shortColor = input.color(color.red, "做空箭头与横线颜色", group="显示")
+exitColor = input.color(color.silver, "平仓箭头、文字与横线颜色", group="显示")
+
+arrowGap = input.float(0.4, "箭头距K线（ATR倍数）", minval=0.1, step=0.1, group="显示")
+stackGap = input.float(0.7, "同根开平仓箭头间距（ATR倍数）", minval=0.2, step=0.1, group="显示")
+lineLenBars = input.int(2, "短横线长度（K线间距）", minval=1, maxval=5, group="显示")
+lineWidth = input.int(2, "短横线粗细", minval=1, maxval=4, group="显示")
+
+showDebug = input.bool(false, "标注未开仓原因（排查时开启）", group="诊断", tooltip="仅诊断本版。WT转折成立但未开仓时显示首个未通过原因；数值详情仅放在数据窗口。")
+
+// ───── 4. LazyBear WaveTrend 核心 ─────
+ap = hlc3
+esa = ta.ema(ap, n1)
+d = ta.ema(math.abs(ap - esa), n1)
+ci = d > 0 ? (ap - esa) / (0.015 * d) : na
+wt1 = ta.ema(ci, n2)
+wt2 = ta.sma(wt1, 4)
+
+// ATR只调整箭头显示距离，不参与入场/平仓过滤。
+atr = ta.atr(14)
+spacing = math.max(nz(atr, high - low), syminfo.mintick * 5)
+
+ready = bar_index >= n1 + n2 + 4 and not na(wt1[2]) and not na(wt2[1])
+
+// ───── 5. 转折：不等金叉/死叉 ─────
+// 上一根比上上根低，当前根开始抬高：向上转折。
+turnUp = ready and wt1[1] < wt1[2] and wt1 > wt1[1]
+// 上一根比上上根高，当前根开始回落：向下转折。
+turnDown = ready and wt1[1] > wt1[2] and wt1 < wt1[1]
+
+// B版开仓过滤：检查上一根极值及当时的双线位置。
+// 做多：上一根在超卖区，WT1当时低于WT2，现在上拐。
+longCandidate = turnUp and wt1[1] <= osLevel and wt1[1] < wt2[1]
+// 做空：上一根在超买区，WT1当时高于WT2，现在下拐。
+shortCandidate = turnDown and wt1[1] >= obLevel and wt1[1] > wt2[1]
+
+// ───── 6. 脚本内部方向状态 ─────
+// pos不是账户实际仓位：1=上次开多，-1=上次开空，0=空仓。
+// 使用var而非varip：盘中只是预览，收盘才保存最终状态。
+var int pos = 0
+var bool longArmed = true
+var bool shortArmed = true
+
+// 保存本次执行开始时的状态，仅供诊断，不改变开平仓。
+int posBefore = pos
+bool longArmedBefore = longArmed
+bool shortArmedBefore = shortArmed
+
+bool longEntry = false
+bool shortEntry = false
+bool closeLong = false
+bool closeShort = false
+
+signalReady = ready and (not confirmClose or barstate.isconfirmed)
+
+if signalReady
+    // 依据上一根是否离开区域重新允许开仓。
+    // 与上一根极值的区域判定保持一致，避免离区当根重复开仓。
+    if wt1[1] > osLevel
+        longArmed := true
+    if wt1[1] < obLevel
+        shortArmed := true
+
+    // 先平仓：出现相反转折即可，不必到达另一侧超买/超卖区。
+    if pos == 1 and turnDown
+        closeLong := true
+        pos := 0
+    else if pos == -1 and turnUp
+        closeShort := true
+        pos := 0
+
+    // 再判断开仓。反向开仓必须完整满足B版条件。
+    if pos == 0
+        if longCandidate and (not onePerZone or longArmed)
+            longEntry := true
+            pos := 1
+            longArmed := false
+        else if shortCandidate and (not onePerZone or shortArmed)
+            shortEntry := true
+            pos := -1
+            shortArmed := false
+
+// ───── 7. 箭头位置：同根反手时错开显示 ─────
+longY = low - spacing * arrowGap
+shortY = high + spacing * arrowGap
+closeLongY = high + spacing * (arrowGap + (shortEntry and showEntries ? stackGap : 0.0))
+closeShortY = low - spacing * (arrowGap + (longEntry and showEntries ? stackGap : 0.0))
+
+// 开仓：一个小箭头，不标数字。
+plotshape(series=showEntries and longEntry ? longY : na, title="做多", style=shape.arrowup, location=location.absolute, color=longColor, size=size.tiny, display=display.pane)
+plotshape(series=showEntries and shortEntry ? shortY : na, title="做空", style=shape.arrowdown, location=location.absolute, color=shortColor, size=size.tiny, display=display.pane)
+
+// 平仓：灰色小箭头，只写“平多”或“平空”。
+plotshape(series=showExits and closeLong ? closeLongY : na, title="平多", style=shape.arrowdown, location=location.absolute, color=exitColor, text="平多", textcolor=exitColor, size=size.tiny, display=display.pane)
+plotshape(series=showExits and closeShort ? closeShortY : na, title="平空", style=shape.arrowup, location=location.absolute, color=exitColor, text="平空", textcolor=exitColor, size=size.tiny, display=display.pane)
+
+// ───── 8. 短横线：做多绿，做空红，平仓灰 ─────
+// 盘中使用最新close，会更新；收盘后是该根收盘价。
+// 不锁定首次盘中触发价，也不是实际成交价。
+// 同根反手：两色线在同一价格首尾相接，避免彼此覆盖。
+// 水平延长仅用于显示，动作仍发生在箭头所在的当前K线。
+visibleExit = showExits and (closeLong or closeShort)
+visibleEntry = showEntries and (longEntry or shortEntry)
+
+if showLines
+    if visibleExit
+        line.new(x1=bar_index, y1=close, x2=bar_index + lineLenBars, y2=close, xloc=xloc.bar_index, extend=extend.none, color=exitColor, width=lineWidth)
+    if visibleEntry
+        int startX = bar_index + (visibleExit ? lineLenBars : 0)
+        line.new(x1=startX, y1=close, x2=startX + lineLenBars, y2=close, xloc=xloc.bar_index, extend=extend.none, color=longEntry ? longColor : shortColor, width=lineWidth)
+
+// ───── 9. 可选诊断：默认不在图上添加任何诊断文字 ─────
+// 仅在本版turnUp/turnDown成立而未开仓时显示一个未通过原因。
+// 若连转折都未成立，检查数据窗口中的WT值和上/下拐标记。
+if showDebug and turnUp and not longEntry
+    string reason = "未满足入场条件"
+    if wt1[1] > osLevel
+        reason := "上一根未到超卖区"
+    else if wt1[1] >= wt2[1]
+        reason := "B版双线过滤未通过"
+    else if posBefore == 1
+        reason := "已有多向状态，不重复开仓"
+    else if onePerZone and not longArmedBefore
+        reason := "同一区段已开过多"
+    else if not signalReady
+        reason := "等待K线收盘"
+    label.new(x=bar_index, y=longY - spacing * 0.7, text="未开多：" + reason, style=label.style_label_up, color=color.new(color.gray, 75), textcolor=chart.fg_color, size=size.tiny)
+
+if showDebug and turnDown and not shortEntry
+    string reason = "未满足入场条件"
+    if wt1[1] < obLevel
+        reason := "上一根未到超买区"
+    else if wt1[1] <= wt2[1]
+        reason := "B版双线过滤未通过"
+    else if posBefore == -1
+        reason := "已有空向状态，不重复开仓"
+    else if onePerZone and not shortArmedBefore
+        reason := "同一区段已开过空"
+    else if not signalReady
+        reason := "等待K线收盘"
+    label.new(x=bar_index, y=shortY + spacing * 0.7, text="未开空：" + reason, style=label.style_label_down, color=color.new(color.gray, 75), textcolor=chart.fg_color, size=size.tiny)
+
+// 这些诊断数值只进数据窗口，不绘制在K线、价格轴或状态栏上。
+plot(showDebug ? wt1 : na, title="诊断 WT1 当前", display=display.data_window, precision=6)
+plot(showDebug ? wt1[1] : na, title="诊断 WT1 上一根", display=display.data_window, precision=6)
+plot(showDebug ? wt1[2] : na, title="诊断 WT1 上上根", display=display.data_window, precision=6)
+plot(showDebug ? wt2[1] : na, title="诊断 WT2 上一根", display=display.data_window, precision=6)
+plot(showDebug ? (turnUp ? 1 : 0) : na, title="诊断 向上转折（1是0否）", display=display.data_window, precision=0)
+plot(showDebug ? (turnDown ? 1 : 0) : na, title="诊断 向下转折（1是0否）", display=display.data_window, precision=0)

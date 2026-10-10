@@ -43,17 +43,22 @@ def signal_for(series, ratio=4):
 class PolicyResearchApiTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
         self.environment = patch.dict(os.environ, {"PULSE_DATA_DIR": self.folder.name, "PULSE_DISABLE_COLLECTOR": "1"})
         self.environment.start()
+        self.addCleanup(self.environment.stop)
         self.collector_patch = patch.object(MonitorService, "start", side_effect=AssertionError("collector must never start in these tests"))
         self.collector_start = self.collector_patch.start()
+        self.addCleanup(self.collector_patch.stop)
         self.network_patch = patch("monitor.history_data._download", side_effect=AssertionError("real archive network is forbidden in these tests"))
         self.network_download = self.network_patch.start()
+        self.addCleanup(self.network_patch.stop)
         self.module_name = "monitor._isolated_policy_research_api_test"
         spec = importlib.util.spec_from_file_location(self.module_name, Path(__file__).resolve().parents[1] / "monitor" / "api.py")
         self.api = importlib.util.module_from_spec(spec)
         sys.modules[self.module_name] = self.api
         spec.loader.exec_module(self.api)
+        self.api.APPLICATION_ROOT = Path(self.folder.name)
         self.client = TestClient(self.api.app)
         self.client.__enter__()
 
@@ -77,7 +82,7 @@ class PolicyResearchApiTests(unittest.TestCase):
 
     def test_default_policy_catalog_and_unvalidated_threshold_labels(self):
         data = self.client.get("/api/settings").json()
-        self.assertEqual(data["indicators"]["enabled_indicators"], ["supertrend", "smc"])
+        self.assertEqual(data["indicators"]["enabled_indicators"], ["wt_extreme_cross"])
         self.assertEqual(data["indicators"]["confirmation_mode"], "all")
         self.assertEqual(data["quality"]["min_activity_score"], 80)
         self.assertEqual(data["quality"]["min_risk_reward"], 2)
@@ -86,37 +91,14 @@ class PolicyResearchApiTests(unittest.TestCase):
         self.assertEqual(data["threshold_prior_status"], "unvalidated_prior")
         self.assertEqual(data["policy_hash"], self.api.policy.fingerprint())
         catalog = self.client.get("/api/indicators").json()
-        self.assertEqual({item["id"] for item in catalog["items"]}, {"supertrend", "smc", "ema"})
+        self.assertEqual({item["id"] for item in catalog["items"]}, {"wt_extreme_cross", "nan_strategy1_oversold"})
         self.assertFalse(catalog["custom_code_execution"])
         self.assertFalse(data["telegram_enabled"])
 
-    def test_custom_indicator_editor_validates_and_saves_without_arbitrary_code(self):
-        spec = {"id":"rsi_gate","name":"RSI 动量确认","description":"安全表达式示例",
-                "long_expression":"rsi(14) > 55 and close > ema(20)",
-                "short_expression":"rsi(14) < 45 and close < ema(20)"}
-        validated = self.client.post("/api/custom-indicators/validate", json=spec, headers=HEADERS)
-        self.assertEqual(validated.status_code, 200, validated.text)
-        self.assertTrue(validated.json()["valid"])
-        self.assertEqual(validated.json()["required_history"], 20)
-        saved = self.client.post("/api/custom-indicators", json={**spec,"status":"validated"}, headers=HEADERS)
-        self.assertEqual(saved.status_code, 200, saved.text)
-        self.assertEqual(saved.json()["item"]["status"], "validated")
-        self.assertFalse(saved.json()["automatic_live_enable"])
-        listed = self.client.get("/api/custom-indicators").json()
-        self.assertEqual([item["id"] for item in listed["items"]], ["rsi_gate"])
-        self.assertFalse(listed["automatic_live_enable"])
-
-        malicious = {**spec,"id":"bad_code","long_expression":"__import__('os').system('whoami') > 0"}
-        report = self.client.post("/api/custom-indicators/validate", json=malicious, headers=HEADERS)
-        self.assertEqual(report.status_code, 200, report.text)
-        self.assertFalse(report.json()["valid"])
-        rejected = self.client.post("/api/custom-indicators", json={**malicious,"status":"validated"}, headers=HEADERS)
-        self.assertEqual(rejected.status_code, 400, rejected.text)
-        self.assertEqual([item["id"] for item in self.client.get("/api/custom-indicators").json()["items"]], ["rsi_gate"])
 
     def test_select_one_or_many_indicators_persists_and_changes_fingerprint(self):
         original_hash = self.api.policy.fingerprint()
-        for selection, mode in (([], "all"), (["ema"], "all"), (["supertrend", "smc", "ema"], "any")):
+        for selection, mode in (([], "all"), (["wt_extreme_cross"], "all"), (["wt_extreme_cross"], "any")):
             requested = self.api.policy.model_dump()
             requested["indicators"].update(enabled_indicators=selection, confirmation_mode=mode)
             response = self.client.put("/api/settings", json=requested, headers=HEADERS)
@@ -131,7 +113,7 @@ class PolicyResearchApiTests(unittest.TestCase):
     def test_invalid_ema_duplicate_or_unknown_indicator_never_persists(self):
         original = self.api.policy.model_dump()
         original_hash = self.api.policy.fingerprint()
-        changes = [{"enabled_indicators": ["ema", "ema"]},
+        changes = [{"enabled_indicators": ["wt_extreme_cross", "wt_extreme_cross"]},
                    {"enabled_indicators": ["upload_python"]}, {"ema_fast_period": 60, "ema_slow_period": 50},
                    {"smc_internal_length": 20, "smc_swing_length": 10}, {"confirmation_mode": "majority"}]
         for fields in changes:
@@ -144,12 +126,12 @@ class PolicyResearchApiTests(unittest.TestCase):
 
     def test_demo_policy_preview_tracks_saved_indicator_selection_and_quality(self):
         request = self.api.policy.model_dump()
-        request["indicators"]["enabled_indicators"] = ["ema"]
+        request["indicators"]["enabled_indicators"] = ["wt_extreme_cross"]
         request["quality"]["min_activity_score"] = 100
         self.assertEqual(self.client.put("/api/settings", json=request, headers=HEADERS).status_code, 200)
         rows = self.client.get("/api/signals?mode=demo").json()["items"]
         self.assertEqual(len(rows), 8)
-        self.assertTrue(all([item["id"] for item in row["confirmations"]] == ["ema"] for row in rows))
+        self.assertTrue(all([item["id"] for item in row["confirmations"]] == ["wt_extreme_cross"] for row in rows))
         self.assertTrue(all(not row["qualified"] for row in rows))
 
     def test_policy_thresholds_use_maximum_of_global_and_timeframe(self):
@@ -171,7 +153,7 @@ class PolicyResearchApiTests(unittest.TestCase):
         original = settings.model_dump()
         fingerprint = settings.fingerprint()
         transform = self.api.freeze_transform(settings)
-        settings.indicators.enabled_indicators = ["ema"]
+        settings.indicators.enabled_indicators = ["wt_extreme_cross"]
         settings.volatility_ratio_min = 4
         series = candles()
         result = self.client.portal.call(transform, signal_for(series), series, {})

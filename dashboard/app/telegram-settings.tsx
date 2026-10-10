@@ -1,6 +1,9 @@
 'use client';
+import {RuleDeliveryFields,type RuleDeliveryPreferences} from './rule-delivery';
+import {IndependentRuleFields,selectedProfiles,type DeliveryProfile} from './independent-rule-fields';
+import { WorkspaceTabs } from './workspace-tabs';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Bell,
@@ -16,14 +19,16 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 
-type TelegramTimeframe = '5m' | '15m';
+type TelegramTimeframe = '1m' | '5m' | '15m' | '30m' | '1h' | '4h' | '1d' | '1w' | '1M';
+const RULE_TIMEFRAMES:TelegramTimeframe[]=['1m','5m','15m','30m','1h','4h','1d','1w','1M'];
 type TelegramDirection = 'long' | 'short';
-type TelegramStrategy = 'supertrend' | 'smc';
+type TelegramStrategy = 'wt_extreme_cross'|'nan_strategy1_oversold';
 type TelegramStrategyMode = 'any' | 'all';
-type TelegramActivityThreshold = 65 | 80 | 90;
+type TelegramActivityThreshold = 0 | 35 | 50 | 65 | 80 | 90;
 type TelegramSignalScope = 'activity' | 'qualified';
 
-export type TelegramPreferences = {
+export type TelegramPreferences = RuleDeliveryPreferences & {
+  rule_settings?:DeliveryProfile[]|null;
   timeframes: TelegramTimeframe[];
   directions: TelegramDirection[];
   min_activity: TelegramActivityThreshold;
@@ -81,19 +86,7 @@ const STRATEGIES: {
   id: TelegramStrategy;
   name: string;
   description: string;
-}[] = [
-  {
-    id: 'supertrend',
-    name: '指标 1 · 超级趋势',
-    description: '用 ATR 趋势方向确认多空。',
-  },
-  {
-    id: 'smc',
-    name: '指标 2 · 智慧资金结构',
-    description:
-      '先检查支撑压力、订单块与区间位置；压力区不追多，支撑区不追空。',
-  },
-];
+}[] = [{id:'wt_extreme_cross',name:'WaveTrend · 超买超卖交叉',description:'收盘确认超买超卖交叉。'},{id:'nan_strategy1_oversold',name:'楠策略1超买超卖',description:'WT极值转折入场，相反转折平仓。'}];
 
 const parseError = async (response: Response, fallback: string) => {
   try {
@@ -110,16 +103,18 @@ const parseError = async (response: Response, fallback: string) => {
 const normalizePreferences = (
   value?: Partial<TelegramPreferences> | null,
 ): TelegramPreferences => ({
+  rule_settings:value?.rule_settings??null,
+  event_kind:value?.event_kind||'anomaly',rules:value?.rules||[],patterns:value?.patterns||[],min_actionability:value?.min_actionability||0,require_book:value?.require_book||false,
   timeframes:
     value?.timeframes?.filter(
-      (item): item is TelegramTimeframe => item === '5m' || item === '15m',
+      (item): item is TelegramTimeframe => RULE_TIMEFRAMES.includes(item),
     ) || DEFAULT_PREFERENCES.timeframes,
   directions:
     value?.directions?.filter(
       (item): item is TelegramDirection => item === 'long' || item === 'short',
     ) || DEFAULT_PREFERENCES.directions,
   min_activity:
-    value?.min_activity === 65 ||
+    value?.min_activity === 0 || value?.min_activity === 35 || value?.min_activity === 50 || value?.min_activity === 65 ||
     value?.min_activity === 80 ||
     value?.min_activity === 90
       ? value.min_activity
@@ -127,7 +122,7 @@ const normalizePreferences = (
   strategies:
     value?.strategies?.filter(
       (item): item is TelegramStrategy =>
-        item === 'supertrend' || item === 'smc',
+        ['wt_extreme_cross','nan_strategy1_oversold'].includes(item),
     ) || DEFAULT_PREFERENCES.strategies,
   strategy_mode:
     value?.strategy_mode === 'all' ? 'all' : DEFAULT_PREFERENCES.strategy_mode,
@@ -162,6 +157,9 @@ export function TelegramSettingsPanel({
   const [snapshot, setSnapshot] = useState<TelegramSettingsSnapshot>({});
   const [preferences, setPreferences] =
     useState<TelegramPreferences>(DEFAULT_PREFERENCES);
+  const savedPreferences = useRef<TelegramPreferences|null>(null);
+  const [ruleNames,setRuleNames]=useState<Record<string,string>>({});
+  useEffect(()=>{if(!api)return;const abort=new AbortController();fetch(api+'/api/telegram/rule-catalog',{signal:abort.signal}).then(async r=>await r.json() as {indicator:{id:string;name:string}[];quant:{id:string;name:string}[]}).then(r=>setRuleNames(Object.fromEntries([...r.indicator,...r.quant].map(v=>[v.id,v.name])))).catch(()=>{});return()=>abort.abort();},[api]);
   const [botToken, setBotToken] = useState('');
   const [pairing, setPairing] = useState<PairingResponse>({});
   const [loading, setLoading] = useState(false);
@@ -191,14 +189,16 @@ export function TelegramSettingsPanel({
         setSnapshot(next);
         if (next.preferences) {
           const normalized = normalizePreferences(next.preferences);
-          setPreferences(
-            next.subscriber?.paired
+          const received = next.subscriber?.paired
               ? normalized
               : {
                   ...normalized,
                   signals_enabled: false,
-                },
-          );
+                };
+          const baseline = savedPreferences.current;
+          setPreferences(current => quiet && baseline && JSON.stringify(current)!==JSON.stringify(baseline)
+            ? current : received);
+          savedPreferences.current = received;
         }
         if (next.subscriber?.paired) {
           setPairing({});
@@ -282,6 +282,11 @@ export function TelegramSettingsPanel({
   };
 
   const validateChoices = () => {
+    if(preferences.rule_settings!=null){
+      if(preferences.rule_settings.some(r=>!r.timeframes.length))return '每项规则至少选择一个周期。';
+      if(preferences.rule_settings.some(r=>![r.min_activity,r.min_actionability].every(v=>Number.isFinite(v)&&v>=0&&v<=100)))return '各项分数应为0至100。';
+      return '';
+    }
     if (!preferences.timeframes.length) return '至少选择一个推送周期。';
     if (!preferences.directions.length) return '至少选择一个信号方向。';
     return '';
@@ -314,14 +319,16 @@ export function TelegramSettingsPanel({
           'Content-Type': 'application/json',
           'X-Pulse-Client': 'dashboard',
         },
-        body: JSON.stringify({ preferences: safePreferences }),
+        body: JSON.stringify({ preferences: {...safePreferences,rule_settings:selectedProfiles(safePreferences)} }),
         signal: AbortSignal.timeout(8000),
       });
       if (!response.ok)
         throw new Error(await parseError(response, '保存推送规则失败。'));
       const next = (await response.json()) as TelegramSettingsSnapshot;
       setSnapshot(next);
-      setPreferences(normalizePreferences(next.preferences || safePreferences));
+      const received = normalizePreferences(next.preferences || safePreferences);
+      savedPreferences.current = received;
+      setPreferences(received);
       setFeedback({
         tone: 'success',
         text: '推送规则已保存。没有发送 Telegram 消息。',
@@ -342,7 +349,7 @@ export function TelegramSettingsPanel({
       setFeedback({ tone: 'error', text: '请先填写 Bot Token。' });
       return;
     }
-    if (botToken.trim() && !telegramTokenLooksValid(botToken)) {
+    if (!snapshot.connected && botToken.trim() && !telegramTokenLooksValid(botToken)) {
       setFeedback({
         tone: 'error',
         text: 'Bot Token 格式不完整，请重新复制 BotFather 提供的整段内容。',
@@ -373,7 +380,7 @@ export function TelegramSettingsPanel({
           'X-Pulse-Client': 'dashboard',
         },
         body: JSON.stringify({
-          ...(botToken.trim() ? { bot_token: botToken.trim() } : {}),
+          ...(!snapshot.connected && botToken.trim() ? { bot_token: botToken.trim() } : {}),
           preferences: safePreferences,
         }),
         signal: AbortSignal.timeout(8000),
@@ -491,7 +498,7 @@ export function TelegramSettingsPanel({
   const readyToSend = botConnected && subscriberPaired;
   const tokenManagedByEnvironment =
     snapshot.token_source === 'env' || snapshot.token_source === 'environment';
-  const tokenInputLocked = tokenManagedByEnvironment || readyToSend;
+  const tokenInputLocked = tokenManagedByEnvironment || botConnected;
   const sendAdminMenu = async () => {
     if (!api || !online || !readyToSend) {
       setAdminMenuFeedback({
@@ -541,13 +548,11 @@ export function TelegramSettingsPanel({
     : preferences.directions.includes('short')
       ? '做空'
       : '未选择';
-  const strategySummary = !preferences.strategies.length
+  const pureEvent=preferences.event_kind==='indicator'||preferences.event_kind==='quant';
+  const eventLabel=preferences.event_kind==='quant'?'指标策略':preferences.event_kind==='indicator'?'指标策略':preferences.signal_scope==='qualified'?'完整强信号':'强活跃异常';
+  const strategySummary = pureEvent?((preferences.rules||[]).map(id=>ruleNames[id]||id).join(' / ')||'未选规则，此模式不会推送'):!preferences.strategies.length
     ? '空策略（不做指标过滤）'
-    : preferences.strategies.length === 1
-      ? preferences.strategies[0] === 'supertrend'
-        ? '超级趋势'
-        : '智慧资金结构'
-      : `超级趋势 + 智慧资金结构（${preferences.strategy_mode === 'all' ? '全部通过' : '任一通过'}）`;
+    : 'WaveTrend · 超买超卖交叉';
   const exampleScore = Math.min(96, preferences.min_activity + 6);
   const examplePattern = directionExample === '做空' ? '阴阴' : '阳阳';
   const examplePosition =
@@ -564,22 +569,18 @@ export function TelegramSettingsPanel({
     (subscriberPaired ? 1 : 0);
   const pendingCount =
     snapshot.pending_count ?? snapshot.access_control?.pending_requests ?? 0;
+  const firstProfile=selectedProfiles(preferences)[0];
   const preview = [
-    `【PULSE ${preferences.signal_scope === 'qualified' ? '完整强信号' : '强活跃异常'} · 预览示例】`,
-    '品种：BTCUSDT',
-    `周期：${periodExample}`,
-    `方向：${directionExample}`,
-    `K线形态：${examplePattern}`,
-    `活跃度：${exampleScore} / 100（门槛 ≥${preferences.min_activity}）`,
-    `指标确认：${strategySummary}`,
-    `位置判断：${examplePosition}`,
-    `操作提示：${exampleAdvice}`,
-    '完整质量门槛：已通过（预览示例）',
-    '今日出现：第 3 次（同周期 2 · 同方向 2；北京时间隔日清零）',
-    '信号时间：2026-09-02 10:25:00 UTC+8',
-    '说明：仅提醒，不会自动开仓；请结合风险自行判断。',
+    `BTCUSDT · ${firstProfile?.timeframes[0]||'5m'} · 多`,
+    '时间：2026-09-08 10:24:59（北京时间）',
+    '活跃度：65 / 可做度：80',
+    '形态：无',
+    `${firstProfile?.kind==='quant'?'策略':'指标'}：${ruleNames[firstProfile?.rule_id]||'所选规则名称'}（示例）`,
   ].join('\n');
 
+  const pairingCommand = pairing.pairing_url
+    ? '/start ' + (new URL(pairing.pairing_url).searchParams.get('start') || '')
+    : '';
   const pairingExpiryValue = pairingExpiryTimestamp(pairing.pairing_expires_at);
   const pairingExpiry = pairingExpiryValue
     ? new Date(pairingExpiryValue).toLocaleTimeString('zh-CN', {
@@ -624,10 +625,30 @@ export function TelegramSettingsPanel({
         </span>
       </div>
 
-      <div className="telegram-settings-body">
-        <div className="telegram-settings-columns">
-          <div className="telegram-settings-column">
-            <section className="telegram-config-block">
+      <div className="telegram-settings-body"><WorkspaceTabs labels={['连接与绑定','推送条件','消息预览']} footer={<>            <output
+              aria-live="polite"
+              className={'telegram-feedback ' + feedback.tone}
+            >
+              {feedback.tone === 'success' ? (
+                <CheckCircle2 />
+              ) : feedback.tone === 'error' ? (
+                <AlertTriangle />
+              ) : (
+                <ShieldCheck />
+              )}
+              <span>{feedback.text}</span>
+            </output>
+
+            <Button
+              className="telegram-save-preferences"
+              variant="outline"
+              onClick={savePreferences}
+              disabled={saving}
+            >
+              {saving ? <RefreshCw className="spin" /> : <CheckCircle2 />}
+              保存推送规则
+            </Button>
+</>}><section className="telegram-config-block">
               <div className="telegram-block-title">
                 <span>1</span>
                 <div>
@@ -722,11 +743,28 @@ export function TelegramSettingsPanel({
                     <li>在 Telegram 中点击 Start。</li>
                     <li>回到本页，绑定状态会自动更新。</li>
                   </ol>
+                  <div style={{ width: '100%', minWidth: 0 }}>
+                    <b>按钮没有反应？使用 Telegram 网页版或手机手动绑定</b>
+                    <p>打开同一个机器人聊天，复制下方整行命令并发送（包含 /start 后的绑定码）。此命令用于成为管理员，请勿转发给其他人。</p>
+                    <input aria-label="一次性绑定命令" readOnly value={pairingCommand}
+                      onFocus={(event) => event.currentTarget.select()}
+                      style={{ width: '100%', padding: 10, color: 'inherit', background: 'transparent', border: '1px solid #42566d' }} />
+                    <Button variant="outline" onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(pairingCommand);
+                        setFeedback({ tone: 'success', text: '已复制完整绑定命令，请在机器人聊天中发送。' });
+                      } catch {
+                        setFeedback({ tone: 'neutral', text: '浏览器未允许复制；请点击命令框，全选后手动复制。' });
+                      }
+                    }}>复制绑定命令</Button>
+                    <a href="https://web.telegram.org/" target="_blank" rel="noreferrer">打开 Telegram 网页版</a>
+                    <p>绑定后本页自动更新；刷新页面丢失命令时，可重新生成安全链接。</p>
+                  </div>
                 </div>
               ) : (
                 <div className="telegram-pairing-empty">
                   <ShieldCheck />
-                  <p>填写 Token 后生成一次性链接，再去 Telegram 点击 Start。</p>
+                  <p>{botConnected ? '机器人已连接，但尚未绑定管理员。点击下方「保存并生成安全链接」，也可复制生成的完整绑定命令到 Telegram 聊天发送。' : '填写 Token 后生成一次性链接，再去 Telegram 点击 Start。'}</p>
                 </div>
               )}
 
@@ -857,9 +895,7 @@ export function TelegramSettingsPanel({
                   )}
                 </div>
               )}
-            </section>
-
-            <section className="telegram-config-block">
+            </section> <section className="telegram-config-block">
               <div className="telegram-block-title">
                 <span>2</span>
                 <div>
@@ -868,234 +904,7 @@ export function TelegramSettingsPanel({
                 </div>
               </div>
 
-              <fieldset className="telegram-choice-group">
-                <legend>信号口径</legend>
-                <div className="telegram-choice-grid two">
-                  {[
-                    [
-                      'activity',
-                      '按活跃度提醒',
-                      '推荐 · 达到活跃度后再看所选指标',
-                    ],
-                    [
-                      'qualified',
-                      '完整强信号',
-                      '严格 · 活跃度 + 完整质量门槛 + 所选指标全部满足',
-                    ],
-                  ].map(([id, label, help]) => {
-                    const selected = preferences.signal_scope === id;
-                    return (
-                      <button
-                        type="button"
-                        className={
-                          'telegram-scope-card ' +
-                          (selected ? 'is-selected' : '')
-                        }
-                        aria-pressed={selected}
-                        onClick={() =>
-                          setPreferences((current) => ({
-                            ...current,
-                            signal_scope: id as TelegramSignalScope,
-                          }))
-                        }
-                        key={id}
-                      >
-                        <span>{selected ? <CheckCircle2 /> : <i />}</span>
-                        <span>
-                          <b>{label}</b>
-                          <small>{help}</small>
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-                {preferences.signal_scope === 'qualified' && (
-                  <p className="telegram-strict-warning">
-                    严格口径不会自动降低条件；活跃度、流动性、成本、空间和所选指标有一项未通过，就不会推送。
-                  </p>
-                )}
-              </fieldset>
-
-              <fieldset className="telegram-choice-group">
-                <legend>周期</legend>
-                <div className="telegram-choice-grid two">
-                  {[
-                    ['5m', '5 分钟', '更及时，信号较多'],
-                    ['15m', '15 分钟', '更平稳，噪声较少'],
-                  ].map(([id, label, help]) => {
-                    const value = id as TelegramTimeframe;
-                    const checked = preferences.timeframes.includes(value);
-                    return (
-                      <label
-                        htmlFor={`telegram-timeframe-${id}`}
-                        className={
-                          'telegram-choice-card ' +
-                          (checked ? 'is-selected' : '')
-                        }
-                        key={id}
-                      >
-                        <Checkbox
-                          id={`telegram-timeframe-${id}`}
-                          checked={checked}
-                          onCheckedChange={(next) =>
-                            setListValue('timeframes', value, next)
-                          }
-                        />
-                        <span>
-                          <b>{label}</b>
-                          <small>{help}</small>
-                        </span>
-                      </label>
-                    );
-                  })}
-                </div>
-              </fieldset>
-
-              <fieldset className="telegram-choice-group">
-                <legend>方向</legend>
-                <div className="telegram-choice-grid two">
-                  {[
-                    ['long', '做多', '向上信号'],
-                    ['short', '做空', '向下信号'],
-                  ].map(([id, label, help]) => {
-                    const value = id as TelegramDirection;
-                    const checked = preferences.directions.includes(value);
-                    return (
-                      <label
-                        htmlFor={`telegram-direction-${id}`}
-                        className={
-                          'telegram-choice-card ' +
-                          (checked ? 'is-selected' : '')
-                        }
-                        key={id}
-                      >
-                        <Checkbox
-                          id={`telegram-direction-${id}`}
-                          checked={checked}
-                          onCheckedChange={(next) =>
-                            setListValue('directions', value, next)
-                          }
-                        />
-                        <span>
-                          <b>{label}</b>
-                          <small>{help}</small>
-                        </span>
-                      </label>
-                    );
-                  })}
-                </div>
-              </fieldset>
-
-              <fieldset className="telegram-choice-group">
-                <legend>最低活跃度</legend>
-                <div className="telegram-thresholds">
-                  {[
-                    [65, '较多'],
-                    [80, '推荐'],
-                    [90, '极少'],
-                  ].map(([threshold, label]) => (
-                    <button
-                      type="button"
-                      className={
-                        preferences.min_activity === threshold
-                          ? 'is-selected'
-                          : ''
-                      }
-                      aria-pressed={preferences.min_activity === threshold}
-                      onClick={() =>
-                        setPreferences((current) => ({
-                          ...current,
-                          min_activity: threshold as TelegramActivityThreshold,
-                        }))
-                      }
-                      key={threshold}
-                    >
-                      <b>≥{threshold}</b>
-                      <small>{label}</small>
-                    </button>
-                  ))}
-                </div>
-              </fieldset>
-
-              <fieldset className="telegram-choice-group">
-                <legend>指标筛选</legend>
-                <p className="telegram-choice-help">
-                  两个都不选就是“空策略”，只用两根 K 线、活跃度与基础保护门槛。
-                </p>
-                <div className="telegram-choice-grid">
-                  {STRATEGIES.map((strategy) => {
-                    const checked = preferences.strategies.includes(
-                      strategy.id,
-                    );
-                    return (
-                      <label
-                        htmlFor={`telegram-strategy-${strategy.id}`}
-                        className={
-                          'telegram-choice-card ' +
-                          (checked ? 'is-selected' : '')
-                        }
-                        key={strategy.id}
-                      >
-                        <Checkbox
-                          id={`telegram-strategy-${strategy.id}`}
-                          checked={checked}
-                          onCheckedChange={(next) =>
-                            setListValue('strategies', strategy.id, next)
-                          }
-                        />
-                        <span>
-                          <b>{strategy.name}</b>
-                          <small>{strategy.description}</small>
-                        </span>
-                      </label>
-                    );
-                  })}
-                </div>
-                {!preferences.strategies.length && (
-                  <div className="telegram-empty-strategy">
-                    当前：空策略 · 不做指标过滤
-                  </div>
-                )}
-                {preferences.strategies.length === 2 && (
-                  <div
-                    className="telegram-mode-switch"
-                    aria-label="指标组合方式"
-                  >
-                    <button
-                      type="button"
-                      aria-pressed={preferences.strategy_mode === 'any'}
-                      className={
-                        preferences.strategy_mode === 'any' ? 'active' : ''
-                      }
-                      onClick={() =>
-                        setPreferences((current) => ({
-                          ...current,
-                          strategy_mode: 'any',
-                        }))
-                      }
-                    >
-                      任一通过
-                      <small>信号较多</small>
-                    </button>
-                    <button
-                      type="button"
-                      aria-pressed={preferences.strategy_mode === 'all'}
-                      className={
-                        preferences.strategy_mode === 'all' ? 'active' : ''
-                      }
-                      onClick={() =>
-                        setPreferences((current) => ({
-                          ...current,
-                          strategy_mode: 'all',
-                        }))
-                      }
-                    >
-                      全部通过
-                      <small>更严格</small>
-                    </button>
-                  </div>
-                )}
-              </fieldset>
+              <IndependentRuleFields api={api||null} value={preferences} onChange={v=>setPreferences(current=>({...current,rule_settings:v.rule_settings}))}/>
 
               <div className="telegram-switch-row">
                 <div>
@@ -1125,7 +934,7 @@ export function TelegramSettingsPanel({
                 <div>
                   <Send size={16} />
                   <span>
-                    <b>强信号推送总开关</b>
+                    <b>所选事件推送总开关</b>
                     <small>绑定完成后再开启即可</small>
                   </span>
                 </div>
@@ -1138,22 +947,17 @@ export function TelegramSettingsPanel({
                       signals_enabled: next,
                     }))
                   }
-                  aria-label="强信号推送总开关"
+                  aria-label="所选事件推送总开关"
                 />
               </div>
 
               <div className="telegram-fixed-rules">
                 <ShieldCheck size={16} />
                 <p>
-                  固定保护：先检查支撑、压力、订单块和区间位置 ·
-                  压力区不把做多候选当入场 · 支撑区不把做空候选当入场 ·
-                  只处理新收盘信号 · 不补发历史记录 · 同一信号只发一次
+                  每项规则按自己的周期、币种、形态和两个分数门槛筛选。仅推送新收盘信号，同一用户同一事件只发一次；策略保留原有开平仓含义。
                 </p>
               </div>
-            </section>
-          </div>
-
-          <aside className="telegram-preview-column">
+            </section> <aside className="telegram-preview-column">
             <div className="telegram-preview-heading">
               <div>
                 <span>3</span>
@@ -1187,8 +991,8 @@ export function TelegramSettingsPanel({
                 <div>
                   <b>
                     {readyToSend && preferences.signals_enabled
-                      ? '强信号推送已开启'
-                      : '目前不会收到强信号'}
+                      ? '信号推送开关已开启'
+                      : '当前信号推送未开启'}
                   </b>
                   <span>
                     {!subscriberPaired
@@ -1207,17 +1011,13 @@ export function TelegramSettingsPanel({
                 <div>
                   <dt>口径</dt>
                   <dd>
-                    {preferences.signal_scope === 'qualified'
-                      ? '完整强信号'
-                      : '强活跃异常'}
+                    {preferences.rule_settings!=null?"各规则独立筛选":eventLabel}
                   </dd>
                 </div>
                 <div>
                   <dt>周期</dt>
                   <dd>
-                    {preferences.timeframes.length
-                      ? preferences.timeframes.join(' + ')
-                      : '未选择'}
+                    {preferences.rule_settings!=null?'按各项卡片设置':preferences.timeframes.join(' + ')}
                   </dd>
                 </div>
                 <div>
@@ -1232,11 +1032,11 @@ export function TelegramSettingsPanel({
                 </div>
                 <div>
                   <dt>门槛</dt>
-                  <dd>活跃度 ≥{preferences.min_activity}</dd>
+                  <dd>{preferences.rule_settings!=null?'每项可做度、活跃度独立':`活跃度 ≥${preferences.min_activity}`}</dd>
                 </div>
                 <div>
                   <dt>指标</dt>
-                  <dd>{strategySummary}</dd>
+                  <dd>{preferences.rule_settings!=null?`已选 ${preferences.rule_settings.length} 项`:strategySummary}</dd>
                 </div>
                 <div>
                   <dt>新合约</dt>
@@ -1249,32 +1049,7 @@ export function TelegramSettingsPanel({
               </dl>
             </div>
 
-            <output
-              aria-live="polite"
-              className={'telegram-feedback ' + feedback.tone}
-            >
-              {feedback.tone === 'success' ? (
-                <CheckCircle2 />
-              ) : feedback.tone === 'error' ? (
-                <AlertTriangle />
-              ) : (
-                <ShieldCheck />
-              )}
-              <span>{feedback.text}</span>
-            </output>
-
-            <Button
-              className="telegram-save-preferences"
-              variant="outline"
-              onClick={savePreferences}
-              disabled={saving}
-            >
-              {saving ? <RefreshCw className="spin" /> : <CheckCircle2 />}
-              保存推送规则
-            </Button>
-          </aside>
-        </div>
-      </div>
+</aside></WorkspaceTabs></div>
     </section>
   );
 }

@@ -102,7 +102,7 @@ def signal(**changes):
         "quality_schema_version": 2,
         "quality_reasons": ["成本后空间不足", "买卖价差过大"],
         "available_confirmations": [
-            {"id": "supertrend", "passed": True},
+            {"id": "wt_extreme_cross", "passed": True},
             {"id": "smc", "passed": True},
         ],
         "trade_plan": {"direction": "long", "reference_entry": 62450.5,
@@ -113,11 +113,23 @@ def signal(**changes):
 
 
 class PreferenceTests(unittest.TestCase):
+    def test_message_filter_description_tracks_mode_and_exact_thresholds(self):
+        from monitor.telegram import filter_description
+        anomaly=normalize_preferences({'min_activity':80,'strategy_mode':'any','strategies':['wt_extreme_cross']})
+        text=format_signal(signal(),anomaly)
+        self.assertIn('活跃原分≥80（非百分比）',text)
+        self.assertIn('任一通过',text)
+        pure=normalize_preferences({**anomaly,'event_kind':'indicator','rules':['wt_extreme_cross'],'require_book':True})
+        description=filter_description(pure)
+        self.assertIn('价差≤0.08%、流动性分位≥40%',description)
+        self.assertIn('不要求两 K 异常',description)
+        self.assertNotIn('方向确认',description)
+
     def test_reset_filters_keeps_both_delivery_switches(self):
         reset = reset_filter_preferences({
             "timeframes": ["5m"], "directions": ["short"],
             "min_activity": 90, "signal_scope": "qualified",
-            "strategies": ["supertrend", "smc"], "strategy_mode": "all",
+            "strategies": ["wt_extreme_cross"], "strategy_mode": "all",
             "signals_enabled": True, "listing_enabled": False,
         })
         self.assertEqual(reset["timeframes"], ["5m", "15m"])
@@ -145,7 +157,7 @@ class PreferenceTests(unittest.TestCase):
         self.assertNotIn("signal_mode", migrated)
 
     def test_activity_and_qualified_scopes_are_explicit(self):
-        strategy_filter = {"strategies": ["supertrend", "smc"], "strategy_mode": "all"}
+        strategy_filter = {"strategies": ["wt_extreme_cross"], "strategy_mode": "all"}
         activity = normalize_preferences({**strategy_filter, "signal_scope": "activity",
                                           "signals_enabled": True})
         strict = normalize_preferences({**strategy_filter, "signal_scope": "qualified",
@@ -153,25 +165,25 @@ class PreferenceTests(unittest.TestCase):
         self.assertTrue(signal_matches(signal(), activity)[0])
         self.assertFalse(signal_matches(signal(), strict)[0])
         self.assertTrue(signal_matches(signal(qualified=True), strict)[0])
-        activity_text = format_signal(signal(), activity, ["supertrend", "smc"])
-        strict_text = format_signal(signal(qualified=True), strict, ["supertrend", "smc"])
-        self.assertIn("PULSE｜强活跃异常", activity_text)
-        self.assertIn("策略：超级趋势 + 智慧资金结构（SMC）", activity_text)
+        activity_text = format_signal(signal(), activity, ["wt_extreme_cross"])
+        strict_text = format_signal(signal(qualified=True), strict, ["wt_extreme_cross"])
+        self.assertIn("合约推送｜强活跃异常", activity_text)
+        self.assertIn("策略：WaveTrend · 超买超卖交叉", activity_text)
         self.assertIn("完整门槛：未通过", activity_text)
         self.assertIn("未通过原因：成本后空间不足；买卖价差过大", activity_text)
-        self.assertIn("PULSE｜完整强信号", strict_text)
+        self.assertIn("合约推送｜完整强信号", strict_text)
         self.assertIn("完整门槛：已通过", strict_text)
 
     def test_filters_and_multi_strategy_match_one_logical_event(self):
         base = normalize_preferences({"signals_enabled": True,
-                                      "strategies": ["supertrend", "smc"],
+                                      "strategies": ["wt_extreme_cross"],
                                       "strategy_mode": "all"})
-        self.assertEqual(signal_matches(signal(), base), (True, ["supertrend", "smc"]))
+        self.assertEqual(signal_matches(signal(), base), (True, ["wt_extreme_cross"]))
         any_strategy = normalize_preferences({**base, "strategy_mode": "any"})
         one_pass = signal(available_confirmations=[
-            {"id": "supertrend", "passed": True}, {"id": "smc", "passed": False}])
-        self.assertEqual(signal_matches(one_pass, any_strategy), (True, ["supertrend"]))
-        self.assertFalse(signal_matches(one_pass, base)[0])
+            {"id": "wt_extreme_cross", "passed": True}, {"id": "smc", "passed": False}])
+        self.assertEqual(signal_matches(one_pass, any_strategy), (True, ["wt_extreme_cross"]))
+        self.assertTrue(signal_matches(one_pass, base)[0])
         self.assertFalse(signal_matches(signal(timeframe="15m"), {**base, "timeframes": ["5m"]})[0])
         self.assertFalse(signal_matches(signal(activity_score=79), base)[0])
         self.assertFalse(signal_matches(signal(delayed=True), base)[0])
@@ -183,8 +195,8 @@ class PreferenceTests(unittest.TestCase):
         keyboard = menu_keyboard(raw)
         callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
         labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
-        self.assertTrue(any("超级趋势" in label for label in labels))
-        self.assertTrue(any("智慧资金结构" in label for label in labels))
+        self.assertTrue(any("WaveTrend" in label for label in labels))
+        self.assertFalse(any("智慧资金结构" in label for label in labels))
         self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callbacks))
 
     def test_listing_template_localizes_exchange_metadata(self):
@@ -290,6 +302,21 @@ class TelegramRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"chat_id": 1001', json.dumps(status, ensure_ascii=False))
         self.assertEqual(status["chat_id_masked"], "****1001")
         self.assertNotIn("pairing_url", status)
+
+    async def test_pending_owner_can_bind_by_pasted_command_and_clears_pending(self):
+        connected = await self.service.connect()
+        code = parse_qs(urlparse(connected['pairing_url']).query)['start'][0]
+        message = {'text': '/start', 'chat': {'id': 1001, 'type': 'private'},
+                   'from': {'id': 1001, 'first_name': 'Owner'}}
+        await self.service._handle_update({'message': message})
+        self.assertIsNone(self.service.state.administrator())
+        notices = [payload.get('text', '') for method, payload in self.clients[0].calls if method == 'sendMessage']
+        self.assertTrue(any('尚未绑定首位管理员' in value for value in notices))
+        self.assertEqual(len(self.service.state.pending_requests()), 1)
+        await self.service._handle_update({'message': {**message, 'text': f'/start {code}'}})
+        self.assertEqual(self.service.state.administrator()['bound_user_id'], 1001)
+        self.assertEqual(self.service.safe_status()['pending_count'], 0)
+        self.assertEqual(self.service.safe_status()['authorized_count'], 1)
 
     async def test_preconnect_event_is_never_replayed_and_delivery_is_deduplicated(self):
         old = signal(id="old")
@@ -504,11 +531,34 @@ class TelegramRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(edits[0]["message_id"], 41)
         self.assertTrue(any(item["user_id"] == 3003 for item in self.service.state.pending_requests()))
 
+    async def test_personal_pure_rule_callbacks_preserve_other_users_and_page(self):
+        await self._bind_admin()
+        self.service.state.add_user(2002,1001,normalize_preferences({}))
+        original=self.service.state.subscriber(chat_id=1001)['preferences']
+        async def click(data):
+            await self.service._handle_callback({'id':'test-rule','data':data,'from':{'id':2002},
+                'message':{'message_id':55,'chat':{'id':2002,'type':'private'}}})
+        await click('p:source:indicator')
+        await click('p:rules:all')
+        await click('p:tf:all')
+        await click('p:pattern:all')
+        await click('p:book')
+        p=self.service.state.subscriber(chat_id=2002)['preferences']
+        self.assertEqual(set(p['timeframes']),{'1m','5m','15m','30m','1h','4h','1d','1w','1M'})
+        self.assertEqual(set(p['rules']),{'wt_extreme_cross','nan_strategy1_oversold'})
+        self.assertEqual(len(p['patterns']),4)
+        self.assertTrue(p['require_book'])
+        self.assertFalse(p['signals_enabled'])
+        await click('p:page:2')
+        edits=[p for method,p in self.clients[0].calls if method=='editMessageText']
+        self.assertTrue(any('1/1' in b['text'] for row in edits[-1]['reply_markup']['inline_keyboard'] for b in row))
+        self.assertEqual(self.service.state.subscriber(chat_id=1001)['preferences'],original)
+
     async def test_reset_shortcut_resets_only_filters_for_each_user(self):
         await self._bind_admin()
         custom = normalize_preferences({
             "timeframes": ["5m"], "directions": ["short"], "min_activity": 90,
-            "signal_scope": "qualified", "strategies": ["smc"], "strategy_mode": "all",
+            "signal_scope": "qualified", "strategies": ["wt_extreme_cross"], "strategy_mode": "all",
             "signals_enabled": True, "listing_enabled": False,
         })
         self.service.state.update_preferences(custom, chat_id=1001)
@@ -687,6 +737,8 @@ class TelegramApiTests(unittest.TestCase):
         self.api = importlib.util.module_from_spec(spec)
         sys.modules[self.module_name] = self.api
         spec.loader.exec_module(self.api)
+        self.lock_patch=patch("monitor.instance_lock.InstanceLock.acquire")
+        self.lock_patch.start();self.addCleanup(self.lock_patch.stop)
         self.client = TestClient(self.api.app)
         self.client.__enter__()
 
@@ -706,7 +758,7 @@ class TelegramApiTests(unittest.TestCase):
         self.assertTrue(initial.json()["preferences"]["listing_enabled"])
         preferences = {**DEFAULT_PREFERENCES, "timeframes": ["5m"],
                        "directions": ["short"], "min_activity": 65,
-                       "signal_scope": "qualified", "strategies": ["smc"],
+                       "signal_scope": "qualified", "strategies": ["wt_extreme_cross"],
                        "strategy_mode": "any", "listing_enabled": False}
         with patch("monitor.telegram._crypt_protect", return_value=b"encrypted-token"):
             saved = self.client.put("/api/telegram/settings", headers=HEADERS,
@@ -721,6 +773,16 @@ class TelegramApiTests(unittest.TestCase):
         after = self.client.get("/api/telegram/settings")
         self.assertNotIn(TOKEN, json.dumps(after.json(), ensure_ascii=False))
         self.assertNotIn("bot_token", after.json())
+
+    def test_independent_profiles_round_trip_in_api_without_sending(self):
+        from monitor.live_rule_signals import rule_catalog
+        profiles=[dict(kind=k,rule_id=rule_catalog(k)[0]['id'],timeframes=[tf],min_activity=37,min_actionability=62,patterns=[],symbols=symbols) for k,tf,symbols in [('indicator','1h',['BTCUSDT'])]]
+        response=self.client.put('/api/telegram/settings',headers=HEADERS,json={'preferences':{**DEFAULT_PREFERENCES,'rule_settings':profiles}})
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertEqual(self.client.get('/api/telegram/settings').json()['preferences']['rule_settings'],profiles)
+        profiles[0]['timeframes']=[]
+        bad=self.client.put('/api/telegram/settings',headers=HEADERS,json={'preferences':{**DEFAULT_PREFERENCES,'rule_settings':profiles}})
+        self.assertEqual(bad.status_code,422)
 
     def test_connect_uses_mock_bot_api_and_only_returns_one_time_pairing_link(self):
         with patch("monitor.telegram._crypt_protect", return_value=b"encrypted-token"):

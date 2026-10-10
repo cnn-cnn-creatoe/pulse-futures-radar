@@ -623,7 +623,7 @@ def run(database_path: Path, output_path: Path, start_text: str = "2026-08-01",
         query_start = start - 7 * DAY - 2 * TIMEFRAME_MS["15m"]
         query_end = end + 5 * TIMEFRAME_MS["15m"]
         engine_config = EngineConfig(volatility_ratio_min=1.5, pattern_mode="all", allow_doji=False)
-        indicator_config = IndicatorConfig(enabled_indicators=("supertrend", "smc"), confirmation_mode="all")
+        indicator_config = IndicatorConfig(enabled_indicators=("wt_extreme_cross",), confirmation_mode="all")
         candidates: list[Any] = []
         liquidity_series: dict[str, tuple[array, array]] = {}
         coverage_by_pair: dict[tuple[str, str], dict[str, Any]] = {}

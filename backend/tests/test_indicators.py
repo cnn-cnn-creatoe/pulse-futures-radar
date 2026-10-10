@@ -57,24 +57,13 @@ def actionable_position(candles, direction="up"):
 
 class ConfigurationTests(unittest.TestCase):
     def test_defaults_and_allowlist_registry(self):
-        self.assertEqual(IndicatorConfig().enabled_indicators, ("supertrend", "smc"))
-        self.assertEqual({item["id"] for item in indicator_catalog()}, {"supertrend", "smc", "ema"})
+        self.assertEqual(IndicatorConfig().enabled_indicators, ("wt_extreme_cross",))
+        self.assertEqual({item["id"] for item in indicator_catalog()}, {"wt_extreme_cross", "nan_strategy1_oversold"})
         catalog = indicator_catalog()
-        catalog[0]["parameters"].append("bad")
-        self.assertNotIn("bad", indicator_catalog()[0]["parameters"])
-        self.assertEqual(IndicatorConfig(enabled_indicators=["ema"]).enabled_indicators, ("ema",))
+        catalog[0]["name"]="bad"
+        self.assertNotEqual("bad", indicator_catalog()[0]["name"])
+        self.assertEqual(IndicatorConfig(enabled_indicators=["wt_extreme_cross"]).enabled_indicators, ("wt_extreme_cross",))
 
-    def test_catalog_exposes_chinese_visual_layers_and_formula_defaults(self):
-        catalog = {item["id"]: item for item in indicator_catalog()}
-        self.assertEqual(catalog["supertrend"]["defaults"], {
-            "source": "HL2（最高价与最低价的平均值）", "atr_period": 10,
-            "atr_multiplier": 3.0, "atr_method": "Wilder RMA",
-        })
-        self.assertEqual(catalog["smc"]["glossary"]["BOS"], "结构突破")
-        self.assertEqual(catalog["smc"]["glossary"]["CHoCH"], "趋势变化")
-        self.assertEqual({layer["id"] for layer in catalog["smc"]["visual_layers"]},
-                         {"events", "order_blocks", "equal_levels", "strong_weak", "fvgs", "zone_bounds"})
-        self.assertEqual(catalog["smc"]["license"], "CC BY-NC-SA 4.0")
 
     def test_bad_indicator_configuration_rejected(self):
         for change in ({"enabled_indicators": ["arbitrary_code"]}, {"enabled_indicators": ["ema", "ema"]},
@@ -368,59 +357,7 @@ class InputIntegrityTests(unittest.TestCase):
 
 
 class QualityTests(unittest.TestCase):
-    def test_smc_fails_closed_when_support_and_resistance_position_is_unknown(self):
-        signal, candles = candidate_fixture()
-        context = indicator_context(candles, config())
-        context["smc"].update(
-            ready=True,
-            direction="up",
-            events=[{"event": "BOS", "direction": "up", "time": candles[-1].close_time}],
-            position_assessment=None,
-        )
-        with patch("monitor.indicators.indicator_context", return_value=context):
-            result = evaluate_candidate(signal, candles, config(enabled_indicators=("smc",)))
-        self.assertFalse(result["confirmations"][0]["passed"])
-        self.assertIn("位置未确认", result["confirmations"][0]["reason"])
-        self.assertEqual(result["position_assessment"]["status"], "wait")
-        self.assertTrue(result["position_assessment"]["blocked"])
-        self.assertEqual(result["entry_advice"], "等待位置确认")
 
-    def test_smc_same_direction_bos_fails_inside_opposite_order_block(self):
-        signal, candles = candidate_fixture()
-        context = indicator_context(candles, config())
-        context["smc"].update(
-            ready=True,
-            direction="up",
-            events=[{"event": "BOS", "direction": "up", "time": candles[-1].close_time}],
-            position_assessment={
-                "assessed_at": candles[-1].close_time,
-                "uses_closed_bars_only": True,
-                "code": "upper_resistance",
-                "label": "前方压力区（突破未站稳）",
-                "reason": "当前位于看跌订单块内，向上突破尚未满足连续3根收盘站稳",
-                "reference_type": "bearish_order_block",
-                "level": 8.2,
-                "zone_low": 8.1,
-                "zone_high": 8.3,
-                "distance_pct": 0.0,
-                "breakout_confirmed": False,
-                "long_allowed": False,
-                "short_allowed": True,
-                "long_advice": "不宜追多",
-                "short_advice": "压力附近，可观察做空",
-            },
-        )
-        with patch("monitor.indicators.indicator_context", return_value=context):
-            result = evaluate_candidate(signal, candles, config(enabled_indicators=("smc",)))
-        smc = result["confirmations"][0]
-        self.assertFalse(smc["passed"])
-        self.assertIn("不宜追多", smc["reason"])
-        self.assertEqual(result["entry_advice"], "不宜追多")
-        self.assertTrue(result["position_assessment"]["blocked"])
-        self.assertEqual(result["position_assessment"]["status"], "blocked")
-        self.assertEqual(result["position_assessment"]["trade_direction"], "long")
-        self.assertEqual(result["position_assessment"]["reference_type"], "bearish_order_block")
-        self.assertTrue(any(reason.startswith("位置硬门禁") for reason in result["quality_reasons"]))
 
     def test_batch_policy_evaluation_matches_individual_results_and_computes_once(self):
         signal, candles = candidate_fixture()
@@ -444,7 +381,11 @@ class QualityTests(unittest.TestCase):
     def test_raw_mode_records_anomaly_but_waits_when_position_is_unknown(self):
         signal, candles = candidate_fixture()
         original = deepcopy(signal)
-        result = evaluate_candidate(signal, candles, config(enabled_indicators=()))
+        from monitor.shortlist import ITEMS
+        # A user's saved ten shortcuts can differ from the archived shortlist.
+        # Pin this fixture's choices without reading or modifying their settings.
+        with patch('monitor.shortcut_rules.selected',return_value=ITEMS):
+            result = evaluate_candidate(signal, candles, config(enabled_indicators=()))
         self.assertFalse(result["qualified"])
         self.assertEqual(result["position_assessment"]["status"], "wait")
         self.assertEqual(result["entry_advice"], "等待位置确认")
@@ -453,7 +394,7 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(result["confirmations"], [])
         self.assertEqual(
             [item["id"] for item in result["available_confirmations"]],
-            ["supertrend", "smc", "ema"],
+            [] + [item["id"] for item in ITEMS],
         )
         self.assertEqual(signal, original)
         result["nested"]["unchanged"].append(3)
@@ -509,41 +450,7 @@ class QualityTests(unittest.TestCase):
             result = evaluate_candidate({**signal, **changes}, candles, config(enabled_indicators=()))
             self.assertFalse(result["qualified"])
 
-    def test_any_vs_all_and_stale_reversal_confirmation(self):
-        signal, candles = candidate_fixture()
-        context = indicator_context(candles, config())
-        context["supertrend"].update(ready=True, direction="up", flip_time=candles[-1].close_time)
-        context["ema"].update(ready=True, direction="down")
-        context["smc"]["position_assessment"] = actionable_position(candles)
-        with patch("monitor.indicators.indicator_context", return_value=context):
-            any_result = evaluate_candidate(signal, candles, config(enabled_indicators=("supertrend", "ema"), confirmation_mode="any"))
-            all_result = evaluate_candidate(signal, candles, config(enabled_indicators=("supertrend", "ema"), confirmation_mode="all"))
-        self.assertTrue(any_result["qualified"], any_result["quality_reasons"])
-        self.assertFalse(all_result["qualified"])
-        candles[-2] = replace(candles[-2], open=9.2)
-        signal["pattern"] = "阴阳"
-        with patch("monitor.indicators.indicator_context", return_value=context):
-            recent = evaluate_candidate(signal, candles, config(enabled_indicators=("supertrend",)))
-            context["supertrend"]["flip_time"] = candles[-5].close_time
-            stale = evaluate_candidate(signal, candles, config(enabled_indicators=("supertrend",)))
-        self.assertTrue(recent["confirmations"][0]["passed"])
-        self.assertFalse(stale["confirmations"][0]["passed"])
-        self.assertEqual(stale["setup"], "reversal")
 
-    def test_smc_reversal_requires_choch_not_only_bos(self):
-        signal, candles = candidate_fixture()
-        candles[-2] = replace(candles[-2], open=9.2)
-        signal["pattern"] = "阴阳"
-        context = indicator_context(candles, config())
-        event = {"event": "BOS", "direction": "up", "time": candles[-1].close_time}
-        context["smc"].update(ready=True, direction="up", events=[event],
-                              position_assessment=actionable_position(candles))
-        with patch("monitor.indicators.indicator_context", return_value=context):
-            bos_only = evaluate_candidate(signal, candles, config(enabled_indicators=("smc",)))
-            event["event"] = "CHoCH"
-            reversal = evaluate_candidate(signal, candles, config(enabled_indicators=("smc",)))
-        self.assertFalse(bos_only["confirmations"][0]["passed"])
-        self.assertTrue(reversal["confirmations"][0]["passed"])
 
 
 if __name__ == "__main__":

@@ -86,7 +86,7 @@ class DeliveryTests(unittest.TestCase):
             (batch / "batch.manifest.json").write_text(json.dumps({"items": items}), "utf-8")
             delivered = deliver_batch(batch, research)
             self.assertEqual(len(delivered["published_jobs"]), 2)
-            self.assertEqual(delivered["merged_summary"]["rows"], 84)
+            self.assertEqual(delivered["merged_summary"]["rows"], 12)
             self.assertEqual(delivered["merged_trades"]["rows"], 0)
             self.assertEqual(delivered["merged_entry_summary"]["rows"], 16)
             for path in list(batch.glob("*.csv")) + list(research.glob("*.csv")):

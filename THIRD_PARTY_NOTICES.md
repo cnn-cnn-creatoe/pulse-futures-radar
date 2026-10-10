@@ -2,7 +2,7 @@
 
 ## Supertrend 与 Smart Money Concepts
 
-SMC 计算改编自用户提供的 © LuxAlgo《Smart Money Concepts》Pine v5 源码，适用 CC BY-NC-SA 4.0（署名、非商业、相同方式共享）；商业使用需另行取得许可。改编部分保留同一许可，完整改编差异与出处见 [指标声明](backend/INDICATORS_LICENSE.md)。看板的 `public/licenses/` 同时提供声明与改编源码。图表是已确认结构的实现，不是原 TradingView 脚本全部功能的逐项复刻。
+SMC 计算改编自用户提供的 © LuxAlgo《Smart Money Concepts》Pine v5 源码，适用 CC BY-NC-SA 4.0（署名、非商业、相同方式共享）；商业使用需另行取得许可。改编部分保留同一许可，完整改编差异与出处见 [指标声明](backend/INDICATORS_LICENSE.md)。看板的 `public/licenses/` 提供许可声明；当前基础评分实现见 `backend/monitor/indicators.py`。图表是已确认结构的实现，不是原 TradingView 脚本全部功能的逐项复刻。
 
 Supertrend 按用户给出的独立公式实现，默认 HL2 / ATR10 / 3倍，支持 Wilder 与 SMA。代码片段未带作者许可头，不额外声称第三方授权。
 
@@ -54,3 +54,5 @@ Copyright (с) 2025 TradingView, Inc. https://www.tradingview.com/
 - [USD-M REST 行情文档](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data)
 - [WebSocket 连接与路由](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Connect)
 - [市场数据流](https://developers.binance.info/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/market)
+
+2026-10-08：`backend/monitor/smc_structure.py` 新增内部5/波段50的BOS、CHoCH盘中适配，基于用户提供的 © LuxAlgo Pine v5，适配代码保持 CC BY-NC-SA 4.0。预览使用未收盘价格并回滚到上根收盘状态；去重与Telegram传输由本项目新增。当前独立实时 SMC 还包含 ATR200 过滤的供需订单块、触区、受阻、反弹及失效观察；不包含 FVG、EQH/EQL。

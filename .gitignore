@@ -45,3 +45,11 @@ htmlcov/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# All dependency trees are installed from lockfiles
+**/node_modules/
+
+# Private local backups and research output
+/backups/
+/research/
+/outputs/

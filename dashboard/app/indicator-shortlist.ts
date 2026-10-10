@@ -1,0 +1,16 @@
+export const INDICATOR_SHORTLIST = [
+  {
+    "id": "wt_extreme_cross",
+    "short": "WaveTrend",
+    "name": "WaveTrend · 超买超卖交叉",
+    "family": "震荡 / WaveTrend",
+    "help": "HLC3 · 10 / 21 / 4；WT1低于-53金叉或高于53死叉，收盘确认，无原生平仓。"
+  },
+  {
+    "id": "nan_strategy1_oversold",
+    "short": "楠策略1",
+    "name": "楠策略1超买超卖",
+    "family": "自创 / WaveTrend",
+    "help": "WT极值后转折入场，相反转折平仓；先平后开，不加仓。"
+  }
+];

@@ -21,6 +21,8 @@ from urllib.parse import quote
 import urllib.request
 import zipfile
 
+from .archive_gate import archive_gate
+from .periods import floor_bar, shift, count_bars
 from .engine import Candle, TIMEFRAME_MS, _valid_prices, _valid_volume
 
 MAX_DOWNLOAD_BYTES = 50_000_000
@@ -63,8 +65,8 @@ def validate_series(candles: list[Candle], now_ms: int | None = None) -> dict:
         if candle.symbol != symbol or candle.timeframe != timeframe:
             raise ValueError("mixed symbols/timeframes in historical series")
         if (type(candle.open_time) is not int or type(candle.close_time) is not int
-                or candle.open_time < 0 or candle.open_time % interval
-                or candle.close_time != candle.open_time + interval - 1):
+                or candle.open_time < 0 or floor_bar(candle.open_time,timeframe) != candle.open_time
+                or candle.close_time != shift(candle.open_time,timeframe) - 1):
             raise ValueError(f"invalid millisecond UTC timestamp at row {i + 1}")
         if candle.closed is not True or candle.close_time >= now_ms:
             raise ValueError(f"unclosed/future candle at row {i + 1}")
@@ -74,9 +76,9 @@ def validate_series(candles: list[Candle], now_ms: int | None = None) -> dict:
             delta = candle.open_time - candles[i - 1].open_time
             if delta <= 0:
                 raise ValueError("historical timestamps must be unique and increasing")
-            if delta != interval:
+            if candle.open_time != shift(candles[i - 1].open_time,timeframe):
                 gaps += 1
-                missing += delta // interval - 1
+                missing += count_bars(candles[i - 1].open_time,candle.open_time,timeframe) - 2
     return {"symbol": symbol, "timeframe": timeframe, "bars": len(candles),
             "first_close_time": candles[0].close_time,
             "last_close_time": candles[-1].close_time, "gaps": gaps,
@@ -180,13 +182,15 @@ def _download(url: str, limit: int) -> bytes:
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             raise ValueError("archive redirect refused; use the official documented source")
-    try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
-            data = response.read(limit + 1)
-    except urllib.error.HTTPError as exc:
-        if exc.code in {403, 451}:
-            raise ValueError(f"official historical archive denied access (HTTP {exc.code}); no fallback attempted") from exc
-        raise ValueError(f"official historical archive unavailable (HTTP {exc.code})") from exc
+    with archive_gate.request():
+        try:
+            with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+                data = response.read(limit + 1)
+        except urllib.error.HTTPError as exc:
+            archive_gate.reject(exc.code, exc.headers.get("Retry-After") if exc.headers else None)
+            if exc.code in {403, 451}:
+                raise ValueError(f"official historical archive denied access (HTTP {exc.code}); no fallback attempted") from exc
+            raise ValueError(f"official historical archive unavailable (HTTP {exc.code})") from exc
     if len(data) > limit:
         raise ValueError("archive download exceeds size limit")
     return data

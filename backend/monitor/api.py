@@ -10,7 +10,7 @@ import os
 import threading
 import time
 import asyncio
-from typing import Literal
+from typing import Any, Literal
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
@@ -18,7 +18,7 @@ from .engine import EngineConfig, MONITOR_TIMEFRAMES, TIMEFRAME_MS, LOOKBACK
 from .demo import demo_signals
 from .store import Store
 from .collector import MonitorService
-from .policy import Settings, ENGINE_KEYS, THRESHOLD_PRIORS, apply_policy
+from .policy import Settings, ENGINE_KEYS, THRESHOLD_PRIORS, apply_policy, migrate_saved_settings
 from .indicators import indicator_catalog, indicator_context
 from .custom_indicators import (
     CustomIndicatorRegistry,
@@ -29,6 +29,8 @@ from .research import (MAX_RESEARCH_BARS, Research, backtest_summary_csv,
                        backtest_trades_csv)
 from .history_data import parse_candles_csv, parse_candles_json, valid_contract_symbol
 from .download_api import install_download_routes
+from .daily_journal import DailyArchives, SimpleReplay, install_daily_routes, record_custom
+from .workbench import Workbench, install_workbench_routes
 from .telegram import (TelegramError, TelegramService, TokenStorageError,
                        normalize_preferences)
 from .update import CURRENT_VERSION, UpdateError, UpdateService
@@ -42,7 +44,7 @@ def load_policy():
         saved = json.loads(CONFIG_FILE.read_text('utf-8'))
         if saved.get('baseline_method')=='winsorized_mean':
             saved['baseline_method']='trimmed_mean'
-        return Settings(**saved)
+        return Settings(**migrate_saved_settings(saved))
     return Settings()
 policy = load_policy()
 def load_config():
@@ -53,14 +55,28 @@ telegram_service = TelegramService(DATA)
 update_service = UpdateService(APPLICATION_ROOT)
 service.notification_sink = telegram_service.enqueue
 service.notification_enabled = lambda: telegram_service.safe_status()['enabled']
+custom_indicators = CustomIndicatorRegistry(DATA / 'custom_indicators.json')
 def freeze_transform(settings):
     snapshot = settings.model_copy(deep=True)
+    specs = []
     async def transform(signal,candles,enrichment):
-        return await asyncio.to_thread(apply_policy,signal,candles,snapshot)
+        def evaluate():
+            result = apply_policy(signal,candles,snapshot)
+            return record_custom(result,candles,specs) if specs else result
+        return await asyncio.to_thread(evaluate)
     return transform
 service.candidate_transform = freeze_transform(policy)
 research = Research(DATA / 'backtest')
-custom_indicators = CustomIndicatorRegistry(DATA / 'custom_indicators.json')
+daily_archives = DailyArchives(store, DATA / 'backtest' / 'daily')
+simple_replay = SimpleReplay(store, research, custom_indicators, DATA / 'backtest' / 'replays')
+workbench = Workbench(store, research, custom_indicators, DATA / 'backtest' / 'workbench')
+workbench.fetch_page = service.fetch_research_page
+from .live_rule_signals import LiveRuleSignals
+live_rules=LiveRuleSignals(store,telegram_service,lambda:policy,now=service.now)
+service.minute_rule_sink=live_rules.enqueue_minute
+from .smc_live import SmcLive, equity
+smc_live=SmcLive(service,telegram_service,DATA / "smc-triggers.sqlite3")
+telegram_service.equity_symbols=lambda: sorted(s for s,m in service._metadata.items() if equity(m))
 LOG = logging.getLogger(__name__)
 DATABASE_COUNTS_TTL_SECONDS = 60.0
 _counts_lock = threading.Lock()
@@ -151,7 +167,7 @@ def _shutdown_database_counts() -> None:
 
 @lru_cache(maxsize=16)
 def _cached_demo(config_json: str):
-    snapshot = Settings(**json.loads(config_json))
+    snapshot = Settings(**migrate_saved_settings(json.loads(config_json)))
     return demo_signals(snapshot.engine(),indicator_config=snapshot.indicator_config(),quality=snapshot.quality.model_dump())
 
 def demo_rows():
@@ -159,15 +175,20 @@ def demo_rows():
 
 @asynccontextmanager
 async def lifespan(app):
+    from .instance_lock import InstanceLock
+    instance = InstanceLock(APPLICATION_ROOT / '.runtime' / 'backend-instance.lock')
+    instance.acquire()
     try:
         # Seed before live collection so the first status request is immediate
         # and the initial full scan cannot delay collector writes.
         _seed_database_counts()
+        daily_archives.start()
         # Telegram starts first so the live collector can hand it only events
         # created after this process is ready.  No saved alert history is read.
         await telegram_service.start_if_enabled()
         if os.getenv('PULSE_DISABLE_COLLECTOR') != '1':
             await service.start()
+            smc_live.start()
             # The collector has already restored its exact startup inventory.
             # Refresh the dashboard cache independently before requests begin;
             # the scan itself continues in the background.
@@ -176,12 +197,38 @@ async def lifespan(app):
     finally:
         download_inventory_cache.close()
         _shutdown_database_counts()
+        await extra_periods.close()
+        await smc_live.close()
         await service.stop()
+        await live_rules.close()
         await telegram_service.close()
         await research.close()
+        await simple_replay.close()
+        await workbench.close()
+        await daily_archives.close()
         store.close()
+        instance.close()
 
-app = FastAPI(title='PULSE 合约异动雷达',version=CURRENT_VERSION.removeprefix('v'),lifespan=lifespan)
+app = FastAPI(title='合约推送',version=CURRENT_VERSION.removeprefix('v'),lifespan=lifespan)
+
+@app.get('/api/smc/status')
+async def smc_status(day: str | None = None):
+    try:
+        return smc_live.status(day)
+    except ValueError:
+        raise HTTPException(status_code=400, detail='日期格式应为 YYYY-MM-DD')
+
+@app.get('/api/smc/contracts')
+async def smc_contracts():
+    return dict(items=[dict(symbol=s,name=m.get('baseAsset',s)) for s,m in sorted(service._metadata.items()) if equity(m)])
+
+@app.get('/api/telegram/rule-catalog')
+def telegram_rule_catalog():
+    from .live_rule_signals import rule_catalog
+    from .selected_period_rules import TIMEFRAMES
+    return dict(indicator=rule_catalog('indicator'),quant=rule_catalog('quant'),timeframes=list(TIMEFRAMES),
+        processed=live_rules.processed,dropped=live_rules.dropped,queue=live_rules.queue.qsize(),last_error=live_rules.last_error)
+
 ALLOWED_ORIGINS = ['http://127.0.0.1:5173','http://localhost:5173']
 app.add_middleware(CORSMiddleware,allow_origins=ALLOWED_ORIGINS,allow_methods=['GET','PUT','POST'],allow_headers=['Content-Type','X-Pulse-Client'])
 
@@ -193,7 +240,13 @@ def require_dashboard(request:Request):
         raise HTTPException(403,'缺少看板请求标记')
 
 download_inventory_cache = install_download_routes(app,store,service,require_dashboard)
+install_daily_routes(app,store,daily_archives,simple_replay,lambda: policy,require_dashboard)
+install_workbench_routes(app,workbench,require_dashboard,lambda: policy,lambda symbol:service._live_klines.get(symbol))
 
+
+@app.get('/api/execution-checks')
+def execution_checks():
+    return {'checked_at':service.now(),'items':{s:service.execution_snapshot(s) for s in list(service._metadata)}}
 
 @app.get('/api/update/status')
 def update_status(force: bool = False):
@@ -213,17 +266,24 @@ def apply_update(request:Request):
 
 class TelegramPreferencesInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    timeframes:list[Literal['5m','15m']] = Field(default_factory=lambda:['5m','15m'],min_length=1,max_length=2)
+    rule_settings:list[dict[str,Any]]|None = Field(None,max_length=512)
+    timeframes:list[Literal['1m','5m','15m','30m','1h','4h','1d','1w','1M']] = Field(default_factory=lambda:['5m','15m'],min_length=1,max_length=9)
     directions:list[Literal['long','short']] = Field(default_factory=lambda:['long','short'],min_length=1,max_length=2)
-    min_activity:Literal[65,80,90] = 80
+    min_activity:Literal[0,35,50,65,80,90] = 80
+    event_kind:Literal['anomaly','indicator','quant'] = 'anomaly'
+    rules:list[str] = Field(default_factory=list,max_length=128)
+    patterns:list[Literal['阳阳','阴阴','阳阴','阴阳']] = Field(default_factory=list,max_length=4)
+    min_actionability:float = Field(0,ge=0,le=100,allow_inf_nan=False)
+    require_book:bool = False
     signal_scope:Literal['activity','qualified'] = 'activity'
-    strategies:list[Literal['supertrend','smc']] = Field(default_factory=list,max_length=2)
+    strategies:list[Literal['wt_extreme_cross','nan_strategy1_oversold']] = Field(default_factory=list,max_length=2)
     strategy_mode:Literal['any','all'] = 'any'
     listing_enabled:bool = True
     signals_enabled:bool = False
 
     @model_validator(mode='after')
     def unique_choices(self):
+        normalize_preferences(self.model_dump())
         if len(set(self.timeframes)) != len(self.timeframes):
             raise ValueError('周期不能重复选择')
         if len(set(self.directions)) != len(self.directions):
@@ -334,7 +394,26 @@ def status():
     telegram_status = telegram_service.safe_status()
     return {**service.status(),'database':counts,'database_counts_updated_at':updated_at,
             'telegram_enabled':telegram_status['enabled'],'telegram':telegram_status,
-            'automatic_trading':False}
+            'automatic_trading':False,'live_rules':live_rules.status()}
+
+_research_page_lock=asyncio.Lock()
+
+@app.get('/api/research/klines')
+async def research_klines(request:Request,symbol:str,interval:Literal['5m','1h','4h','1d'],
+                          startTime:int=Query(ge=0),endTime:int=Query(ge=0)):
+    require_dashboard(request)
+    if not valid_contract_symbol(symbol) or startTime>endTime:
+        raise HTTPException(400,'无效的合约或时间范围')
+    if not service._running:
+        raise HTTPException(503,'行情服务未运行，研究下载暂停')
+    # Keep the raw Binance columns intact and serialize research traffic.
+    async with _research_page_lock:
+        from .collector import MarketAccessError, BinanceRateLimitError
+        try:
+            return await service.fetch_klines(dict(symbol=symbol,interval=interval,startTime=startTime,endTime=endTime,limit=499))
+        except (MarketAccessError,BinanceRateLimitError) as exc:
+            raise HTTPException(503,str(exc)) from exc
+
 
 @app.get('/api/signals')
 def signals(mode:Literal['live','demo']='live',limit:int=Query(10000,ge=1,le=10000),include_candles:bool=True,qualified:bool|None=None):
@@ -363,7 +442,7 @@ def signal_detail(signal_id:str):
         'order_blocks', 'fvgs', 'equal_levels', 'zone_bounds',
         'strong_weak', 'swing_points',
     }
-    if not required_layers.issubset(chart):
+    if not record.get('snapshot_expired') and not required_layers.issubset(chart):
         symbol = str(record.get('symbol') or '').upper()
         timeframe = str(record.get('timeframe') or '')
         cutoff = record.get('second_candle_close_time', record.get('close_time'))
@@ -371,7 +450,7 @@ def signal_detail(signal_id:str):
             candles = store.get_candles(symbol, timeframe, limit=1_000, end=cutoff)
             if candles and candles[-1].close_time <= cutoff:
                 try:
-                    snapshot = Settings(**(record.get('policy_snapshot') or policy.model_dump()))
+                    snapshot = Settings(**migrate_saved_settings(record.get('policy_snapshot') or policy.model_dump()))
                     hydrated = indicator_context(candles, snapshot.indicator_config())
                     record = {**record, 'indicators': hydrated,
                               'chart_schema_version': 2,
@@ -382,6 +461,24 @@ def signal_detail(signal_id:str):
                     pass
     return {'source':'live','item':record,
             'telegram_enabled':telegram_service.safe_status()['enabled']}
+
+from .market_overview import MarketOverview
+market_overview = MarketOverview(store)
+from .extra_periods import ExtraPeriods
+extra_periods = ExtraPeriods(store,research,service)
+
+class PeriodSelection(BaseModel):
+    timeframes: list[str] = Field(default_factory=list,max_length=10)
+
+@app.post("/api/market-periods")
+async def market_periods(body:PeriodSelection,request:Request):
+    require_dashboard(request)
+    try:return extra_periods.select(body.timeframes)
+    except ValueError as exc:raise HTTPException(400,str(exc))
+
+@app.get('/api/market-overview')
+def market_summary():
+    return market_overview.get()
 
 @app.get('/api/universe')
 def universe():
@@ -418,33 +515,13 @@ class CustomIndicatorSave(CustomIndicatorSpec):
 
 @app.get('/api/custom-indicators')
 def list_custom_indicators():
-    try:
-        return {'items':custom_indicators.list(),'language':'pulse-expression-v1',
-                'supported_functions':['sma','ema','rsi','atr','highest','lowest'],
-                'execution':'closed_contiguous_candles_only','automatic_live_enable':False,
-                'note':'已验证只表示语法、因果性与安全校验通过；仍须完成独立历史回测，才可考虑接入实时强筛。'}
-    except IndicatorRegistryError:
-        raise HTTPException(500,'自定义指标库无法安全读取，请检查本地文件完整性')
+    return {'items':[],'automatic_live_enable':False,'note':'研究库仅保留 WaveTrend 超买超卖交叉'}
 
 @app.post('/api/custom-indicators/validate')
-def validate_custom_indicator(body:CustomIndicatorSpec,request:Request):
-    require_dashboard(request)
-    return custom_indicators.validate(body.model_dump())
-
 @app.post('/api/custom-indicators')
-def save_custom_indicator(body:CustomIndicatorSave,request:Request):
+def retired_custom_indicator(request:Request):
     require_dashboard(request)
-    values = body.model_dump()
-    status = values.pop('status')
-    try:
-        item = custom_indicators.save(values,status=status)
-        return {'item':item,'message':('已验证并保存到指标库；先完成单项回测，再允许进入实时强筛。'
-                    if status=='validated' else '草稿已保存；草稿不会执行，也不会进入实时判断。'),
-                'automatic_live_enable':False}
-    except IndicatorValidationError as error:
-        raise HTTPException(400,{'message':'指标代码未通过安全校验','errors':error.errors})
-    except IndicatorRegistryError:
-        raise HTTPException(500,'指标库保存失败，原文件保持不变')
+    raise HTTPException(410,'自定义指标已移除，请使用指标策略研究库')
 
 @app.get('/api/chart/{symbol}/{timeframe}')
 async def chart(symbol:str,timeframe:str,mode:Literal['live','demo']='live'):

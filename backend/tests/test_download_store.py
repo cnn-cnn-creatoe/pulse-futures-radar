@@ -193,13 +193,13 @@ class DownloadStoreTests(unittest.TestCase):
 
     def test_prune_is_reflected_immediately_without_stale_progress_counts(self):
         now = 400 * DAY
-        minute_boundary = now - 14 * DAY
-        intraday_boundary = now - 366 * DAY
+        minute_boundary = now - 30 * DAY
+        intraday_boundary = now - 30 * DAY - 3 * TIMEFRAME_MS["2h"]
         self.store.save_candles([
             bar(minute_boundary - MINUTE), bar(minute_boundary), bar(now - MINUTE),
             bar(intraday_boundary - TIMEFRAME_MS["2h"], timeframe="2h"),
             bar(intraday_boundary, timeframe="2h"), bar(now - TIMEFRAME_MS["2h"], timeframe="2h"),
-            bar(0, timeframe="1d"), bar(DAY, timeframe="1d"),
+            bar(now - 63 * DAY, timeframe="1d"), bar(now - 62 * DAY, timeframe="1d"),
             bar(0, symbol="OLDUSDT"),
         ])
         self.assertEqual(sum(row["bars"] for row in self.store.candle_inventory()), 9)

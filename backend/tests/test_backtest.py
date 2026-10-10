@@ -156,7 +156,7 @@ class ChronologyTests(unittest.TestCase):
         self.assertEqual(study["primary_policy"], "price_only_ablation")
         self.assertFalse(study["selection_performed"])
         self.assertIsNone(study["best_combination"])
-        self.assertEqual(study["trial_count"], 7)
+        self.assertEqual(study["trial_count"], 1)
         self.assertTrue(study["predeclared_combinations"])
         self.assertEqual(study["validation_status"], "chronological_holdout_and_anchored_walk_forward")
         self.assertEqual(study["minimum_closed_trades_per_segment"], 30)
@@ -164,8 +164,7 @@ class ChronologyTests(unittest.TestCase):
         for missing_audit in ("walk-forward", "DSR", "PBO", "cannot be used to select"):
             self.assertIn(missing_audit, warning)
         self.assertEqual([row["enabled_indicators"] for row in study["rows"]], [
-            ["supertrend"], ["smc"], ["ema"], ["supertrend", "smc"],
-            ["supertrend", "ema"], ["smc", "ema"], ["supertrend", "smc", "ema"]])
+            ["wt_extreme_cross"]])
         requested = {tuple(row["enabled_indicators"]) for row in study["rows"]}
         self.assertTrue(requested <= set(configurations))
         for row in study["rows"]:
@@ -193,7 +192,7 @@ class ChronologyTests(unittest.TestCase):
         def evaluate(signal, prefix, config, qualities):
             enabled = tuple(config.enabled_indicators)
             calls.append((enabled, signal["close_time"], prefix[-1].close_time))
-            passed = enabled == ("supertrend",)
+            passed = enabled == ("wt_extreme_cross",)
             plan = {**candidate()["trade_plan"], "support": 95, "resistance": 110,
                     "risk_reward": 2.5, "basis": "confirmed_structure_levels"}
             return [{**signal, "qualified": passed, "quality_reasons": [] if passed else ["confirmation"],
@@ -202,13 +201,13 @@ class ChronologyTests(unittest.TestCase):
             report = run_backtest(bars, options={"max_holding_bars": 1})
         self.assertTrue(all(signal_time == prefix_time for _, signal_time, prefix_time in calls))
         rows = {row["id"]: row for row in report["indicator_study"]["rows"]}
-        supertrend = rows["supertrend"]
+        supertrend = rows["wt_extreme_cross"]
         self.assertGreaterEqual(supertrend["train"]["metrics"]["trades"], 30)
         self.assertGreaterEqual(supertrend["holdout"]["metrics"]["trades"], 30)
         self.assertTrue(supertrend["sample_sufficient_both"])
         self.assertEqual(supertrend["train"]["sample_status"], "sufficient")
         for study_id, row in rows.items():
-            if study_id != "supertrend":
+            if study_id != "wt_extreme_cross":
                 self.assertEqual(row["train"]["metrics"]["trades"], 0)
                 self.assertEqual(row["holdout"]["metrics"]["trades"], 0)
                 self.assertFalse(row["sample_sufficient_both"])
@@ -234,16 +233,15 @@ class ChronologyTests(unittest.TestCase):
              patch("monitor.indicators.indicator_context", wraps=indicator_context) as calculate:
             report = run_backtest(bars)
         self.assertEqual(calculate.call_count, 1)
-        self.assertEqual(len(report["indicator_study"]["rows"]), 7)
+        self.assertEqual(len(report["indicator_study"]["rows"]), 1)
         self.assertEqual({tuple(row["enabled_indicators"]) for row in report["indicator_study"]["rows"]}, {
-            ("supertrend",), ("smc",), ("ema",), ("supertrend", "smc"),
-            ("supertrend", "ema"), ("smc", "ema"), ("supertrend", "smc", "ema")})
+            ("wt_extreme_cross",)})
 
     def test_invalid_series_options_and_insufficient_warmup(self):
         insufficient = run_backtest(synthetic(20))
         self.assertEqual(insufficient["status"], "insufficient_data")
-        self.assertEqual(len(insufficient["indicator_study"]["rows"]), 7)
-        self.assertEqual(insufficient["indicator_study"]["trial_count"], 7)
+        self.assertEqual(len(insufficient["indicator_study"]["rows"]), 1)
+        self.assertEqual(insufficient["indicator_study"]["trial_count"], 1)
         self.assertTrue(insufficient["indicator_study"]["predeclared_combinations"])
         self.assertFalse(insufficient["indicator_study"]["selection_performed"])
         self.assertEqual(insufficient["indicator_study"]["validation_status"],

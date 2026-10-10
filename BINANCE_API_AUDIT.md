@@ -1,3 +1,20 @@
+# 合约推送 v2.0.0 接口验收补充（2026-09-08）
+
+本节描述当前版本；下方旧记录仅保留审计历史，参数冲突以本节和当前代码为准。
+
+- REST 使用官方 `https://fapi.binance.com`。共享预算取 exchangeInfo 公布分钟权重的 45%，观察 `X-MBX-USED-WEIGHT-*`，分钟使用达到官方限额的 80% 时提前退避；K 线分页 499 根。
+- 收到 429 时全局停发并遵守 Retry-After；418 缺少 Retry-After 时默认停 3 天，403/451 停 15 分钟；冷却写入本地，重启仍有效。不会切换代理或镜像规避限制。
+- 使用 `/market/stream` 与 `/public/stream` 对应频道，分片最多 40 个订阅。新连接共享至少 2 秒间隔；服务器 ping/pong、断线退避和 24 小时之前错峰轮换均保留。
+- 历史归档 `data.binance.vision` 与 REST 分开管理：进程内串行传输，请求结束后至少间隔 1 秒；429/418/403/451 持久冷却，尊重 Retry-After。归档不是 live feed 的替代访问入口。
+- 所有新增限流验收使用模拟响应，不通过冲击真实接口测试封禁。
+- IP 额度由同一出口的其他程序共同使用。本进程的预算与单实例保护不能约束另一份目录运行的副本、其他软件或网络出口的其他用户。因此无法给出固定封禁概率或零风险承诺。
+
+官方依据：
+- [USD-M General Info](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/general-info)：IP 权重、429、418、403，以及持续违规后最长三天封禁。
+- [USD-M WebSocket Connect](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Connect)：路由、24 小时连接寿命、ping/pong、每秒 10 条客户端消息和每连接最多 1024 streams。
+
+---
+
 # Binance REST / WebSocket 审计（2026-09-02）
 
 审计范围是当前可执行源码、脚本和测试。用户提供的计划书只作为需求资料；其中出现的接口名称不等于程序会调用。`.runtime` 临时克隆、`release` 旧压缩包、历史 JSON 记录和 `dashboard/node_modules` 不计入运行代码。

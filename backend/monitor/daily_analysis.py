@@ -30,9 +30,7 @@ DAY = 86_400_000
 SHANGHAI = timezone(timedelta(hours=8))
 METHODS = (
     ("two_bar", "仅两根K线"),
-    ("supertrend", "仅超级趋势"),
-    ("smc", "仅SMC"),
-    ("supertrend_smc", "超级趋势+SMC全部满足"),
+    ("wt_extreme_cross", "WaveTrend · 超买超卖交叉"),
 )
 HORIZONS = (1, 2, 3, 5)
 SENSITIVITY_THRESHOLDS = (65, 70, 75, 80)
@@ -228,14 +226,8 @@ def _method_flags(context: dict[str, Any], config: IndicatorConfig,
     if direction is None or context.get("status") != "ready":
         return {method: method == "two_bar" and raw_valid for method, _ in METHODS}, {}
     interval = TIMEFRAME_MS[timeframe]
-    confirmations = {
-        name: _confirmation(name, context, direction, reversal, close_time, interval, config)
-        for name in ("supertrend", "smc")
-    }
-    st = raw_valid and confirmations["supertrend"]["passed"]
-    smc = raw_valid and confirmations["smc"]["passed"]
-    return {"two_bar": raw_valid, "supertrend": st, "smc": smc,
-            "supertrend_smc": st and smc}, confirmations
+    confirmation=_confirmation('wt_extreme_cross',context,direction,reversal,close_time,interval,config)
+    return {'two_bar':raw_valid,'wt_extreme_cross':raw_valid and confirmation['passed']}, {'wt_extreme_cross':confirmation}
 
 
 def _summary_rows(events: list[dict[str, Any]], include_boundary: bool) -> list[dict[str, Any]]:
@@ -298,7 +290,7 @@ def run(database_path: Path, output_path: Path, date_text: str = "2026-09-01") -
                 saved_alerts[row["event_key"]] = payload
         ranks, rank_audit = _liquidity_ranks(database, symbols, onboard, day_start, day_end)
 
-        indicator_config = IndicatorConfig(enabled_indicators=("supertrend", "smc"), confirmation_mode="all")
+        indicator_config = IndicatorConfig(enabled_indicators=("wt_extreme_cross",), confirmation_mode="all")
         engine_config = EngineConfig(volatility_ratio_min=1.5, pattern_mode="all", allow_doji=False)
         fee_bps, slippage_bps = 5.0, 3.0
         coverage = []

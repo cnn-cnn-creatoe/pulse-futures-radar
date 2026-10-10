@@ -49,12 +49,13 @@ try {
     New-Item -ItemType Directory -Path $payloadRoot -Force | Out-Null
     $excludedDirectories = @(
         (Join-Path $projectRoot '.git'), (Join-Path $projectRoot '.runtime'), (Join-Path $projectRoot '.venv'),
+        (Join-Path $projectRoot 'backups'), (Join-Path $projectRoot 'research'), (Join-Path $projectRoot 'outputs'),
         (Join-Path $projectRoot 'release'), (Join-Path $projectRoot '回测结果'),
         (Join-Path $projectRoot 'backend\data'), (Join-Path $projectRoot 'dashboard\node_modules'),
         (Join-Path $projectRoot 'dashboard\dist'), (Join-Path $projectRoot 'dashboard\.next'),
         (Join-Path $projectRoot 'dashboard\.vinext'), (Join-Path $projectRoot 'dashboard\.wrangler'),
         (Join-Path $projectRoot 'dashboard\.openai'),
-        '.git', '__pycache__', '.pytest_cache'
+        '.git', 'node_modules', '__pycache__', '.pytest_cache'
     )
     $excludedFiles = @(
         '*.sqlite', '*.sqlite-wal', '*.sqlite-shm', '*.sqlite3', '*.sqlite3-wal', '*.sqlite3-shm',
@@ -65,11 +66,11 @@ try {
     & robocopy.exe @robocopyArgs | Out-Null
     if ($LASTEXITCODE -gt 7) { throw ('准备发布文件失败（robocopy 退出码 {0}）。' -f $LASTEXITCODE) }
 
-    foreach ($forbidden in @('backend\data', '.runtime', '.venv', 'dashboard\node_modules', 'dashboard\dist', 'dashboard\.next', 'dashboard\.vinext', 'dashboard\.openai')) {
+    foreach ($forbidden in @('backups','research','outputs','backend\data', '.runtime', '.venv', 'dashboard\node_modules', 'dashboard\dist', 'dashboard\.next', 'dashboard\.vinext', 'dashboard\.openai')) {
         if (Test-Path -LiteralPath (Join-Path $payloadRoot $forbidden)) { throw ('发布包安全检查失败，包含了 {0}。' -f $forbidden) }
     }
-    if (Get-ChildItem -LiteralPath $payloadRoot -Directory -Recurse -Force | Where-Object { $_.Name -eq '.git' } | Select-Object -First 1) {
-        throw '发布包安全检查失败，发现嵌套的 Git 元数据。'
+    if (Get-ChildItem -LiteralPath $payloadRoot -Directory -Recurse -Force | Where-Object { $_.Name -in @('.git', 'node_modules') } | Select-Object -First 1) {
+        throw '发布包安全检查失败，发现嵌套的 Git 元数据或依赖缓存。'
     }
     if (Get-ChildItem -LiteralPath $payloadRoot -File -Recurse | Where-Object { $_.Name -match '(?i)(\.(?:sqlite|sqlite3|db)(?:-wal|-shm)?$|\.dpapi$|\.pid$|^\.env(?:\.|$))' } | Select-Object -First 1) {
         throw '发布包安全检查失败，发现数据库、密钥或环境配置文件。'

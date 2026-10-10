@@ -17,6 +17,7 @@ import math
 import random
 import time
 import uuid
+from pathlib import Path
 from collections import deque
 from dataclasses import asdict
 from email.utils import parsedate_to_datetime
@@ -120,7 +121,8 @@ def retry_after_seconds(value: str | None, default: float = 60) -> float:
     if not value:
         return default
     try:
-        return max(1, float(value))
+        seconds = float(value)
+        return max(1,seconds) if math.isfinite(seconds) and seconds >= 0 else default
     except ValueError:
         try:
             return max(1, parsedate_to_datetime(value).timestamp() - time.time())
@@ -130,7 +132,7 @@ def retry_after_seconds(value: str | None, default: float = 60) -> float:
 
 class WeightBudget:
     """Conservative shared REST budget with spacing and exchange cooldown."""
-    def __init__(self, exchange_limit: int = 2400):
+    def __init__(self, exchange_limit: int = 2400, cooldown_path=None):
         self.exchange_limit = max(60, exchange_limit)
         self.per_minute = max(60, int(self.exchange_limit * REST_BUDGET_FRACTION))
         self.used_header = 0
@@ -140,6 +142,15 @@ class WeightBudget:
         self._next = 0.0
         self._lock = asyncio.Lock()
         self._history: deque[tuple[float, int]] = deque()
+        self.cooldown_path = Path(cooldown_path) if cooldown_path else None
+        if self.cooldown_path and self.cooldown_path.exists():
+            try:
+                until = float(json.loads(self.cooldown_path.read_text("utf-8"))["until"])
+                if not math.isfinite(until): raise ValueError("invalid cooldown")
+                self.cooldown_until = time.monotonic() + max(0,until-time.time())
+            except (OSError,ValueError,KeyError,TypeError):
+                self.cooldown_until = time.monotonic()+300
+
 
     async def acquire(self, weight: int) -> None:
         async with self._lock:
@@ -165,7 +176,7 @@ class WeightBudget:
         """Back off before the exchange turns a nearly full minute into a ban."""
         self.used_header = max(0, int(used))
         if self.used_header >= int(self.exchange_limit * REST_HEADER_BACKOFF_FRACTION):
-            self.cooldown_until = max(self.cooldown_until, time.monotonic() + 65)
+            self.defer(65)
 
     def observe_headers(self, headers: Any) -> dict[str, int]:
         """Record every Binance request-weight interval header, not only 1M."""
@@ -187,6 +198,15 @@ class WeightBudget:
 
     def defer(self, seconds: float) -> None:
         self.cooldown_until = max(self.cooldown_until, time.monotonic() + max(1, seconds))
+        if self.cooldown_path:
+            payload = {"until":time.time()+max(0,self.cooldown_until-time.monotonic())}
+            temporary = self.cooldown_path.with_suffix(".tmp")
+            try:
+                temporary.write_text(json.dumps(payload),encoding="utf-8")
+                temporary.replace(self.cooldown_path)
+            except OSError:
+                LOG.error("无法保存限流冷却状态；当前进程仍保持冷却")
+
 
 
 class MonitorService:
@@ -194,6 +214,8 @@ class MonitorService:
         self.store = store
         self.config = config or EngineConfig()
         self.candidate_transform: CandidateTransform | None = None
+        self.closed_rule_sink = None
+        self.minute_rule_sink = None
         # Optional non-blocking live-event sink.  The collector never reads a
         # notification history or owns credentials; failures cannot roll back
         # persisted market evidence.
@@ -246,12 +268,18 @@ class MonitorService:
         self._rank_refreshed_at = 0.0
         self._rank_groups: dict[str, dict] = {}
         self._book_cache: dict[str, tuple[float, float, int]] = {}
+        self._book_history = {}
+        self._ticker_history = {}
         self._book_ticker_events = 0
         self._book_ticker_invalid = 0
         self._connections: dict[str, dict] = {}
         self._connection_delays: dict[str, deque[int]] = {}
         self._errors: deque[dict] = deque(maxlen=16)
-        self._budget = WeightBudget()
+        self._budget = WeightBudget(cooldown_path=Path(store.path).with_suffix(".cooldown.json") if store.path != ":memory:" else None)
+        self._ws_connect_lock = asyncio.Lock()
+        self._ws_next_connect = 0.0
+        self._clock_samples = deque(maxlen=12)
+        self._maintenance_error = None
         # Serialize REST I/O. Once one response is 429/418, no other request can
         # already be in flight and every queued caller sees the shared cooldown.
         self._rest_request_lock = asyncio.Lock()
@@ -377,11 +405,59 @@ class MonitorService:
     def _timestamp_fresh(self, timestamp: int | None, max_age: int = 90_000) -> bool:
         return timestamp is not None and -self._future_slack_ms() <= self.now() - timestamp < max_age
 
+    def _metadata_fresh(self) -> bool:
+        control = self._connections.get("market-control", {})
+        return self._last_refresh > 0 and (
+            self._timestamp_fresh(self._last_refresh,180_000) or
+            (control.get("state") == "connected" and self._timestamp_fresh(control.get("last_event_time"))))
+
+    async def _pace_ws_connection(self) -> None:
+        # Pace handshakes across every shard; respect shared access cooldown.
+        async with self._ws_connect_lock:
+            while True:
+                wait = max(self._ws_next_connect,self._budget.cooldown_until)-time.monotonic()
+                if wait <= 0: break
+                await asyncio.sleep(wait)
+            self._ws_next_connect = time.monotonic()+2.0
+
+    def _ws_failure(self, exc) -> None:
+        status = getattr(exc,"status",None)
+        if status in (403,418,429,451):
+            headers = getattr(exc,"headers",None) or {}
+            default = 259200 if status==418 else 900 if status in (403,451) else 60
+            self._budget.defer(retry_after_seconds(headers.get("Retry-After"),default))
+
+    async def _receive_stream(self, ws, name):
+        connection = self._connections.get(name, {})
+        reference = connection.get("last_event_time") or connection.get("connected_at") or self.now()
+        remaining = (90_000 - (self.now() - reference)) / 1000
+        if remaining <= 0:
+            raise TimeoutError("90秒没有新鲜行情，安排退避重连")
+        # Transport heartbeats and stale packets cannot extend this deadline.
+        return await asyncio.wait_for(ws.receive(), timeout=min(90, remaining))
+
+    def _accept_stream_event(self, name, event_time, received) -> bool:
+        connection = self._connections.setdefault(name,{})
+        self._record_connection_event(name,event_time,received)
+        # One inactive symbol's old event is not a failed multiplexed socket.
+        if self._timestamp_fresh(event_time):
+            connection.pop("invalid_since",None)
+            return True
+        connection["discarded_events"] = connection.get("discarded_events",0)+1
+        began = connection.setdefault("invalid_since",time.monotonic())
+        if time.monotonic()-began >= 30:
+            raise TimeoutError("连接持续30秒没有新鲜行情，安排退避重连")
+        return False
+
     def _record_connection_event(self, name: str, event_time: int, received: int) -> None:
         """Measure content delay independently of transport/last-message liveness."""
         connection = self._connections.setdefault(name, {})
         delay = received - event_time
-        connection.update(last_message=received, last_event_time=event_time, event_delay_ms=delay)
+        connection["last_message"] = received
+        connection["event_delay_ms"] = delay
+        # Future/old packets must not overwrite evidence from a fresh packet.
+        if self._timestamp_fresh(event_time) and event_time >= (connection.get("last_event_time") or 0):
+            connection["last_event_time"] = event_time
         self._connection_delays.setdefault(name, deque(maxlen=256)).append(delay)
 
     def _connection_snapshot(self, name: str, connection: dict) -> dict:
@@ -421,8 +497,13 @@ class MonitorService:
             midpoint, elapsed = sample["midpoint"], sample["rtt_ms"]
         else:
             midpoint = sent + elapsed / 2
-        self._clock_offset = round(int(clock["serverTime"]) - midpoint)
-        self._clock_rtt_ms = elapsed
+        observed = sent+elapsed
+        sample_offset = round(int(clock["serverTime"]) - midpoint)
+        # Prefer a low-RTT sample from the last hour; a slow HTTP response can
+        # otherwise move the clock by seconds and make every shard appear late.
+        self._clock_samples.append((observed,elapsed,sample_offset))
+        usable = [v for v in self._clock_samples if 0 <= observed-v[0] <= 3600000]
+        _,self._clock_rtt_ms,self._clock_offset = min(usable,key=lambda v:v[1])
         self._clock_synced_at = self.now()
 
     async def start(self) -> None:
@@ -461,6 +542,8 @@ class MonitorService:
         self._rank_groups.clear()
         self._mark.clear()
         self._book_cache.clear()
+        self._book_history.clear()
+        self._ticker_history.clear()
         self._book_ticker_events = 0
         self._book_ticker_invalid = 0
         self._rest_usage_history.clear()
@@ -552,9 +635,10 @@ class MonitorService:
                                 "headers": observed,
                             })
                         if response.status in (403, 451):
+                            self._budget.defer(retry_after_seconds(response.headers.get("Retry-After"),900))
                             raise MarketAccessError(f"币安公开行情访问被拒绝（HTTP {response.status}）；请在可合法访问币安的网络或服务器运行")
                         if response.status in (418, 429):
-                            seconds = retry_after_seconds(response.headers.get("Retry-After"))
+                            seconds = retry_after_seconds(response.headers.get("Retry-After"),259200 if response.status==418 else 60)
                             self._budget.defer(seconds)
                             self._error("REST限速", f"HTTP {response.status}，所有REST按 Retry-After 暂停 {seconds:.0f} 秒")
                             # Never retry the triggering request here. Callers
@@ -566,6 +650,10 @@ class MonitorService:
                                                               status=response.status, message="upstream unavailable")
                         response.raise_for_status()
                         data = await response.json()
+                        if isinstance(data, dict) and data.get("code") == -1003:
+                            # Rate-limit payloads also occur behind successful/proxied HTTP responses.
+                            self._budget.defer(259200 if "banned" in str(data.get("msg","")).lower() else 60)
+                            raise BinanceRateLimitError(429,max(1,self._budget.cooldown_until-time.monotonic()))
                         if isinstance(data, dict) and isinstance(data.get("code"), int) and data["code"] < 0:
                             raise ValueError(f"Binance {data['code']}: {data.get('msg', '')}")
                         if path == "/fapi/v1/time" and "serverTime" in data:
@@ -589,6 +677,10 @@ class MonitorService:
             try:
                 await self._sync_clock()
                 if not launched:
+                    for _ in range(2):
+                        if self._clock_rtt_ms <= 500: break
+                        await self._sync_clock()
+                if not launched:
                     self._watermark = self.now()
                 await self._refresh_universe()
                 if not launched:
@@ -604,14 +696,13 @@ class MonitorService:
                         self._spawn(self._recover_worker(), f"gap-recovery-{worker}")
                     self._spawn(self._health_loop(), "market-health")
                     launched = True
+                self._maintenance_error = None
                 self._state = "warming"
                 self._message = "公开行情已连接，正在分批加载 5m / 15m 历史基准"
                 # Contract changes are announced by !contractInfo. REST scope
-                # and clock refreshes happen only at startup, on that event, or
-                # after the control WebSocket reconnects and may have missed an
-                # event. There is no steady one-minute REST polling loop.
-                await self._refresh_requested.wait()
-                self._refresh_requested.clear()
+                # and clock refreshes also run every fifteen minutes as a
+                # low-frequency fallback for missed control events.
+                await self._sleep_or_refresh(900)
             except asyncio.CancelledError:
                 raise
             except MarketAccessError as exc:
@@ -620,9 +711,12 @@ class MonitorService:
                 self._error("公开行情访问", exc)
                 await self._sleep_or_refresh(600)
             except Exception as exc:
-                self._state = "error"
-                self._message = "币安行情暂不可用；自动重试中，不会用演示数据替代实时行情"
-                self._error("行情初始化", exc)
+                # A failed maintenance HTTP request does not invalidate fresh
+                # WebSocket evidence from an already-running collection session.
+                self._maintenance_error = str(exc)[:200] or type(exc).__name__
+                self._state = "degraded" if launched and self._metadata_fresh() else "error"
+                self._message = "合约信息或时间校准更新失败，正在重试；逐合约检查实时行情"
+                self._error("行情初始化或维护", exc)
                 await self._sleep_or_refresh(30)
 
     async def _refresh_universe(self) -> None:
@@ -680,12 +774,10 @@ class MonitorService:
             # changes. Ticker rank updates must not churn live connections.
             shards = self._balanced_kline_shards()
             self._symbol_shard = {symbol: f"kline-{i}" for i, shard in enumerate(shards) for symbol in shard}
-            # Both families share the same frozen symbol partition and lifecycle.
-            # Subscribe only to verified USDT-quoted UM contracts, never merged
-            # UM+CM arrays. Every asset class and delivery tenor is retained.
-            self._shards = [task for i, shard in enumerate(shards) for task in (
-                self._spawn(self._kline_stream(shard, i), f"kline-shard-{i}"),
-                self._spawn(self._market_stream(shard, i), f"market-shard-{i}"))]
+            # Mark-price caches currently have no consumers. Do not keep an
+            # unused second family of sockets open; trading is not enabled.
+            self._shards = [self._spawn(self._kline_stream(shard, i), f"kline-shard-{i}")
+                            for i, shard in enumerate(shards)]
             # These two all-market streams are each one subscription. Payloads
             # are filtered by st=1 and the verified metadata universe.
             self._shards.extend((
@@ -756,6 +848,28 @@ class MonitorService:
             finally:
                 self._warm_pending.discard((symbol, timeframe))
                 self._warm_queue.task_done()
+
+    async def fetch_klines(self, params):
+        """Shared, weight-aware native K-line gateway for SMC and research."""
+        limit=int(params.get('limit',499))
+        if not 1<=limit<=1500:raise ValueError('Invalid kline limit')
+        weight=1 if limit<100 else 2 if limit<500 else 5 if limit<=1000 else 10
+        return await self._request('/fapi/v1/klines',params,weight=weight)
+
+    async def fetch_research_page(self, symbol: str, timeframe: str, start: int, end: int) -> list[Candle]:
+        """Research shares the live REST budget, without changing live gap state."""
+        if timeframe == "1s":
+            raise ValueError("当前 USD-M 合约 K 线接口实测不接受 1 秒周期，已停止请求。秒线需独立成交流采集，不能用分钟线替代。")
+        interval = TIMEFRAME_MS[timeframe]
+        from .periods import count_bars
+        limit = min(499,count_bars(start,end,timeframe))
+        rows = await self._request("/fapi/v1/klines", {
+            "symbol":symbol,"interval":timeframe,"startTime":start,"endTime":end,"limit":limit
+        },weight=1 if limit<100 else 2)
+        candles = [rest_candle(symbol,timeframe,row,self._confirmed_history_now()) for row in rows]
+        if any(not self._valid_candle(c) for c in candles):
+            raise ValueError(f"{symbol} {timeframe} 返回无效 K 线")
+        return candles
 
     async def _fetch_range(self, symbol: str, timeframe: str, start: int, end: int) -> list[Candle]:
         if not eligible_contract(self._metadata.get(symbol, {})):
@@ -938,8 +1052,10 @@ class MonitorService:
         while self._running:
             self._connections[name] = {**self._connections.get(name, {}), "state": "connecting",
                                        "subscriptions": len(symbols), "last_message": None, "last_event_time": None}
+            self._connections[name].pop("invalid_since", None)
             try:
                 assert self._session
+                await self._pace_ws_connection()
                 async with self._session.ws_connect(WS_BASE + "?streams=" + streams, autoping=True,
                                                      heartbeat=60, receive_timeout=90, max_msg_size=2**22) as ws:
                     began = time.monotonic()
@@ -950,7 +1066,7 @@ class MonitorService:
                         self._fence_reconnected_symbols(symbols)
                     connected_before = True
                     while self._running and time.monotonic() - began < self._ws_rollover_seconds(name):
-                        msg = await asyncio.wait_for(ws.receive(), timeout=90)
+                        msg = await self._receive_stream(ws, name)
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             payload = json.loads(msg.data)
                             event = payload.get("data", payload)
@@ -959,11 +1075,10 @@ class MonitorService:
                             if not event.get("E"):
                                 continue  # A transport message is not evidence of fresh market content.
                             event_time = int(event["E"])
-                            self._record_connection_event(name, event_time, received)
-                            if received - event_time > 90_000 or event_time - received > 10_000:
-                                raise TimeoutError("WebSocket 行情时间已过期或超前")
+                            if not self._accept_stream_event(name,event_time,received):
+                                continue
                             self._last_event = max(self._last_event, event_time)
-                            attempt = 0
+                            if time.monotonic()-began >= 60: attempt = 0
                             kline = event.get("k", {})
                             symbol = event.get("s")
                             if event.get("st") not in (None, 1, "1") or symbol not in self._metadata:
@@ -989,6 +1104,7 @@ class MonitorService:
                     last_error_at=self.now(), reconnects=self._connections[name].get("reconnects", 0) + 1)
                 self._download_event("ws_error", message=f"{name}: {str(exc)[:250]}")
                 self._error(name, exc)
+                self._ws_failure(exc)
                 attempt += 1
                 await asyncio.sleep(min(60, 2 ** min(attempt, 6)) + random.random())
 
@@ -1028,7 +1144,7 @@ class MonitorService:
         if not current or event_time >= current["event_time"]:
             self._live_klines[symbol] = {**candle.to_dict(), "closed": False, "source": "websocket",
                                        "event_time": event_time, "observed_at": received,
-                                       "note": "当前1分钟未收盘行情，仅展示，不写入历史或用于信号"}
+                                       "note": "当前1分钟未收盘行情；可用于独立盘中条件预览，不写入历史确认记录"}
         return None
 
     async def _market_stream(self, symbols: list[str], index: int) -> None:
@@ -1042,8 +1158,10 @@ class MonitorService:
             self._connections[name] = {**self._connections.get(name, {}), "state": "connecting",
                 "subscriptions": len(symbols), "symbols_count": len(symbols),
                 "last_message": None, "last_event_time": None}
+            self._connections[name].pop("invalid_since", None)
             try:
                 assert self._session
+                await self._pace_ws_connection()
                 # Official default mark-price cadence is 3s when @1s is omitted.
                 async with self._session.ws_connect(WS_BASE + "?streams=" + streams, autoping=True,
                                                      heartbeat=60, receive_timeout=90, max_msg_size=2**22) as ws:
@@ -1051,7 +1169,7 @@ class MonitorService:
                     self._connections[name].update(state="connected", connected_at=self.now())
                     self._download_event("ws_connected", message=f"{name} 已连接，订阅 {len(symbols)} 个币种的标记价格")
                     while self._running and time.monotonic() - began < self._ws_rollover_seconds(name):
-                        msg = await asyncio.wait_for(ws.receive(), timeout=90)
+                        msg = await self._receive_stream(ws, name)
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             payload = json.loads(msg.data)
                             event = payload.get("data", payload)
@@ -1061,10 +1179,9 @@ class MonitorService:
                                     or event.get("e") != "markPriceUpdate" or not event.get("E")):
                                 continue
                             event_time = int(event["E"])
-                            self._record_connection_event(name, event_time, received)
-                            if received - event_time > 90_000 or event_time - received > 10_000:
-                                raise TimeoutError("WebSocket 行情时间已过期或超前")
-                            attempt = 0
+                            if not self._accept_stream_event(name,event_time,received):
+                                continue
+                            if time.monotonic()-began >= 60: attempt = 0
                             self._consume_market_event(event)
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                             raise ConnectionError(f"{name} WebSocket disconnected: type={msg.type.name}, code={ws.close_code}, "
@@ -1080,6 +1197,7 @@ class MonitorService:
                     "last_error": str(exc)[:300], "last_error_at": self.now(), "reconnects": prior.get("reconnects", 0) + 1}
                 self._download_event("ws_error", message=f"{name}: {str(exc)[:250]}")
                 self._error(name, exc)
+                self._ws_failure(exc)
                 attempt += 1
                 await asyncio.sleep(min(60, 2 ** min(attempt, 6)) + random.random())
 
@@ -1091,15 +1209,17 @@ class MonitorService:
             self._connections[name] = {**self._connections.get(name, {}), "state": "connecting",
                 "subscriptions": 1, "symbols_count": len(self._metadata),
                 "last_message": None, "last_event_time": None}
+            self._connections[name].pop("invalid_since", None)
             try:
                 assert self._session
+                await self._pace_ws_connection()
                 async with self._session.ws_connect(WS_PUBLIC_BASE + "?streams=!bookTicker", autoping=True,
                                                      heartbeat=60, receive_timeout=90, max_msg_size=2**22) as ws:
                     began = time.monotonic()
                     self._connections[name].update(state="connected", connected_at=self.now())
                     self._download_event("ws_connected", message="book-ticker 已连接，全市场最优买卖价由WebSocket更新")
                     while self._running and time.monotonic() - began < self._ws_rollover_seconds(name):
-                        msg = await asyncio.wait_for(ws.receive(), timeout=90)
+                        msg = await self._receive_stream(ws, name)
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             payload = json.loads(msg.data)
                             event = payload.get("data", payload)
@@ -1108,10 +1228,9 @@ class MonitorService:
                             if not isinstance(event, dict) or event.get("e") != "bookTicker" or not event.get("E"):
                                 continue
                             event_time = int(event["E"])
-                            self._record_connection_event(name, event_time, received)
-                            if received - event_time > 90_000 or event_time - received > 10_000:
-                                raise TimeoutError("WebSocket 盘口时间已过期或超前")
-                            attempt = 0
+                            if not self._accept_stream_event(name,event_time,received):
+                                continue
+                            if time.monotonic()-began >= 60: attempt = 0
                             self._consume_book_event(event)
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                             raise ConnectionError(f"{name} WebSocket disconnected: type={msg.type.name}, code={ws.close_code}, "
@@ -1127,6 +1246,7 @@ class MonitorService:
                     "last_error_at": self.now(), "reconnects": prior.get("reconnects", 0) + 1}
                 self._download_event("ws_error", message=f"{name}: {str(exc)[:250]}")
                 self._error(name, exc)
+                self._ws_failure(exc)
                 attempt += 1
                 await asyncio.sleep(min(60, 2 ** min(attempt, 6)) + random.random())
 
@@ -1149,6 +1269,10 @@ class MonitorService:
             self._book_ticker_invalid += 1
             return
         self._book_cache[symbol] = (time.monotonic(), spread, source_time)
+        history=self._book_history.setdefault(symbol,deque(maxlen=120))
+        if not history or source_time>=history[-1][0]:
+            if history and source_time//1000==history[-1][0]//1000:history.pop()
+            history.append((source_time,spread))
         self._book_ticker_events += 1
 
     async def _market_control_stream(self) -> None:
@@ -1161,8 +1285,10 @@ class MonitorService:
             self._connections[name] = {**self._connections.get(name, {}), "state": "connecting",
                 "subscriptions": 2, "symbols_count": len(self._metadata),
                 "last_message": None, "last_event_time": None}
+            self._connections[name].pop("invalid_since", None)
             try:
                 assert self._session
+                await self._pace_ws_connection()
                 async with self._session.ws_connect(WS_BASE + "?streams=" + streams, autoping=True,
                                                      heartbeat=60, receive_timeout=90, max_msg_size=2**23) as ws:
                     began = time.monotonic()
@@ -1175,7 +1301,7 @@ class MonitorService:
                         self._refresh_requested.set()
                     connected_before = True
                     while self._running and time.monotonic() - began < self._ws_rollover_seconds(name):
-                        msg = await asyncio.wait_for(ws.receive(), timeout=90)
+                        msg = await self._receive_stream(ws, name)
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             payload = json.loads(msg.data)
                             event = payload.get("data", payload)
@@ -1187,23 +1313,21 @@ class MonitorService:
                                 if not valid:
                                     continue
                                 event_time = max(int(row["E"]) for row in valid)
-                                self._record_connection_event(name, event_time, received)
-                                if received - event_time > 90_000 or event_time - received > 10_000:
-                                    raise TimeoutError("WebSocket 全市场行情时间已过期或超前")
+                                if not self._accept_stream_event(name,event_time,received):
+                                    continue
                                 self._consume_tickers(valid)
-                                attempt = 0
+                                if time.monotonic()-began >= 60: attempt = 0
                                 continue
                             if not isinstance(event, dict) or event.get("e") != "contractInfo" or not event.get("E"):
                                 continue
                             event_time = int(event["E"])
-                            self._record_connection_event(name, event_time, received)
-                            if received - event_time > 90_000 or event_time - received > 10_000:
-                                raise TimeoutError("WebSocket 合约信息时间已过期或超前")
+                            if not self._accept_stream_event(name,event_time,received):
+                                continue
                             if event.get("st") in (1, "1"):
                                 current = self._metadata.get(event.get("s"))
                                 if current is None or event.get("cs") != current.get("status"):
                                     self._refresh_requested.set()
-                            attempt = 0
+                            if time.monotonic()-began >= 60: attempt = 0
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                             raise ConnectionError(f"{name} WebSocket disconnected: type={msg.type.name}, code={ws.close_code}, "
                                 f"data={str(msg.data)[:120]}, reason={str(msg.extra)[:120]}, exception={str(ws.exception())[:120]}")
@@ -1218,6 +1342,7 @@ class MonitorService:
                     "last_error_at": self.now(), "reconnects": prior.get("reconnects", 0) + 1}
                 self._download_event("ws_error", message=f"{name}: {str(exc)[:250]}")
                 self._error(name, exc)
+                self._ws_failure(exc)
                 attempt += 1
                 await asyncio.sleep(min(60, 2 ** min(attempt, 6)) + random.random())
 
@@ -1265,6 +1390,9 @@ class MonitorService:
                 continue
             self._ticker[symbol] = {"quote_volume": quote_volume, "price": price,
                                     "change_pct": change_pct, "time": event_time}
+            history=self._ticker_history.setdefault(symbol,deque(maxlen=120))
+            if history and event_time//1000==history[-1][0]//1000:history.pop()
+            history.append((event_time,quote_volume))
         self._refresh_volume_ranks(force=rest)
 
     def _refresh_volume_ranks(self, force: bool = False) -> None:
@@ -1427,7 +1555,7 @@ class MonitorService:
                 continue
             if not self._can_alert(candle.symbol, candle.close_time):
                 continue
-            enrichment = self._base_enrichment(candle.symbol)
+            enrichment = self._base_enrichment(candle.symbol, candle.close_time)
             accepted_config = EngineConfig(**asdict(self.config))
             # API replaces this callable with a closure over immutable Settings.
             # Capture it alongside the base config before analysis can yield;
@@ -1447,6 +1575,12 @@ class MonitorService:
                 self._analysis_dropped += 1
                 if self._analysis_dropped == 1 or self._analysis_dropped % 100 == 0:
                     self._error("信号分析队列", f"已跳过 {self._analysis_dropped} 个过期分析任务；K线已安全写入")
+
+        if self.minute_rule_sink:
+            try:
+                self.minute_rule_sink(candle)
+            except Exception as exc:
+                self._error('周期规则队列',type(exc).__name__)
 
     def _advance_pair_state(self, symbol: str, timeframe: str, candle: Candle) -> bool:
         """Advance an already verified live tail without rereading its baseline.
@@ -1520,10 +1654,11 @@ class MonitorService:
 
     @staticmethod
     def _valid_candle(candle: Candle) -> bool:
+        from .periods import floor_bar, shift
         interval = TIMEFRAME_MS.get(candle.timeframe, 0)
         prices = (candle.open, candle.high, candle.low, candle.close)
-        return (bool(interval) and candle.open_time % interval == 0
-                and candle.close_time == candle.open_time + interval - 1
+        return (bool(interval) and floor_bar(candle.open_time,candle.timeframe) == candle.open_time
+                and candle.close_time == shift(candle.open_time,candle.timeframe) - 1
                 and all(math.isfinite(p) and p > 0 for p in prices)
                 and candle.low <= min(candle.open, candle.close) <= max(candle.open, candle.close) <= candle.high
                 and all(math.isfinite(v) and v >= 0 for v in (candle.volume, candle.quote_volume, candle.taker_buy_quote))
@@ -1571,15 +1706,44 @@ class MonitorService:
             volume=sum(item.volume for item in members), closed=True)
         return result if cls._valid_candle(result) else None
 
-    def _base_enrichment(self, symbol: str) -> dict:
+    def _liquidity_bounds_at(self, symbol: str, at: int) -> list | None:
+        quote=self._metadata.get(symbol,{}).get('quoteAsset')
+        peers=[s for s,m in self._metadata.items() if quote and m.get('quoteAsset')==quote]
+        if len(peers)<2:return None
+        values={}
+        for peer in peers:
+            samples=self._ticker_history.get(peer,())
+            sample=next((v for v in reversed(samples) if v[0]<=at),None)
+            current=self._ticker.get(peer,{})
+            if sample is None and isinstance(current.get('time'),int) and current['time']<=at:
+                sample=(current['time'],current['quote_volume'])
+            if sample and 0<=at-sample[0]<=90000:values[peer]=sample[1]
+        if symbol not in values:return None
+        value=values[symbol];unknown=len(peers)-len(values);denom=len(peers)-1
+        return [sum(v<value for v in values.values())/denom,
+                (sum(v<=value for v in values.values())-1+unknown)/denom]
+
+    def _base_enrichment(self, symbol: str, close_time: int | None = None) -> dict:
         ticker = self._ticker.get(symbol, {})
         rank_status = self._liquidity_rank_status(symbol)
         percentile = self._ranks.get(symbol) if rank_status["ready"] and self._timestamp_fresh(ticker.get("time")) else None
+        frozen={}
+        if close_time is not None:
+            bounds=self._liquidity_bounds_at(symbol,close_time)
+            percentile=bounds[0] if bounds and bounds[0]==bounds[1] else None
+            samples=self._book_history.get(symbol,())
+            quote=next((v for v in reversed(samples) if v[0]<=close_time),None)
+            cached=self._book_cache.get(symbol)
+            if quote is None and cached and cached[2]<=close_time:quote=(cached[2],cached[1])
+            valid=quote is not None and 0<=close_time-quote[0]<BOOK_TICKER_TTL_SECONDS*1000
+            frozen=dict(market_evidence_frozen=True,evidence_as_of=close_time,
+                        evidence_observed_at=self.now(),liquidity_bounds=bounds,
+                        spread_bps=quote[1] if valid else None,quote_time=quote[0] if valid else None)
         return {**contract_metadata_fields(self._metadata.get(symbol, {})), "market_type": "UM",
                 "liquidity_percentile": percentile, "liquidity_rank_status": rank_status,
                 "liquidity_rank_scope": "same_quote_asset", "liquidity_peer_count": rank_status.get("peer_count", 0),
                 "liquidity_quote_asset": rank_status.get("quote_asset"), "spread_bps": None,
-                "oi_change_pct": None, "oi_ratio": None}
+                "oi_change_pct": None, "oi_ratio": None, **frozen}
 
     async def _analysis_worker(self) -> None:
         """Read the full baseline and prefilter anomalies off the close path."""
@@ -1590,7 +1754,14 @@ class MonitorService:
                 # single SQLite connection during a whole-market close burst.
                 await self._closed_queue.join()
                 symbol, timeframe, close_time, enrichment = job[:4]
+                if enrichment.get('market_evidence_frozen') and hasattr(self.store,'save_market_evidence'):
+                    await asyncio.to_thread(self.store.save_market_evidence,symbol,close_time,enrichment)
                 if not eligible_contract(self._metadata.get(symbol, {})):
+                    continue
+                # Reject obsolete work before loading thousands of historical bars.
+                # Keep the existing second check after IO for tasks expiring during it.
+                if not self._can_alert(symbol, close_time):
+                    self._record_analysis_expired(symbol, close_time)
                     continue
                 target = LOOKBACK[timeframe]["days"] * DAY // TIMEFRAME_MS[timeframe] + 3
                 candles = await asyncio.to_thread(
@@ -1604,6 +1775,8 @@ class MonitorService:
                 if not self._can_alert(symbol, close_time):
                     self._record_analysis_expired(symbol, close_time)
                     continue
+                if self.closed_rule_sink:
+                    self.closed_rule_sink(candles)
                 accepted_config = (EngineConfig(**enrichment["engine_config_at_close"])
                                    if enrichment.get("engine_config_at_close") else self.config)
                 result = await asyncio.to_thread(
@@ -1656,10 +1829,12 @@ class MonitorService:
                 if close_time <= self._watermark:
                     continue
                 enrichment.update(await asyncio.to_thread(self.oi_enrichment, latest.symbol, latest.timeframe, latest.close_time))
-                try:
-                    enrichment["spread_bps"] = await self._spread(latest.symbol)
-                except Exception as exc:
-                    self._error(f"价差 {latest.symbol}", exc)
+                if not enrichment.get('market_evidence_frozen'):
+                    # Legacy injected jobs only. New close jobs retain their original quote.
+                    try:
+                        enrichment["spread_bps"] = await self._spread(latest.symbol)
+                    except Exception as exc:
+                        self._error(f"价差 {latest.symbol}", exc)
                 accepted_config = EngineConfig(**enrichment["engine_config_at_close"]) if enrichment.get("engine_config_at_close") else self.config
                 result = await asyncio.to_thread(analyze, candles, accepted_config, enrichment, self._tick(latest.symbol))
                 signal = result.get("signal")
@@ -1667,6 +1842,9 @@ class MonitorService:
                     signal.update({"source": "live", "data_source": "Binance USD-M public market",
                                    **contract_metadata_fields(enrichment), "market_type": "UM",
                                    "oi_sample_count": enrichment.get("oi_sample_count", 0),
+                                   "liquidity_bounds": enrichment.get("liquidity_bounds"),
+                                   "quote_time": enrichment.get("quote_time"),
+                                   "evidence_as_of": enrichment.get("evidence_as_of"),
                                    "liquidity_rank_status": enrichment.get("liquidity_rank_status"),
                                    "liquidity_rank_scope": enrichment.get("liquidity_rank_scope"),
                                    "liquidity_peer_count": enrichment.get("liquidity_peer_count"),
@@ -1716,6 +1894,17 @@ class MonitorService:
                             signal[field] = list(values) if isinstance(values, list) else []
                             if value not in signal[field]:
                                 signal[field].append(value)
+                    if signal.get("qualified") and (
+                            not self._symbol_live(symbol) or not self._can_alert(symbol, close_time)):
+                        # Connection/gap state may change while an indicator runs.
+                        # Preserve the event for audit, but revoke actionability.
+                        signal.update(qualified=False, quality_schema_version=2)
+                        reasons = signal.get("rejection_reasons")
+                        signal["rejection_reasons"] = list(reasons) if isinstance(reasons, list) else []
+                        signal["rejection_reasons"].append("market_not_ready_at_publish")
+                        warnings = signal.get("warnings")
+                        signal["warnings"] = list(warnings) if isinstance(warnings, list) else []
+                        signal["warnings"].append("发布时行情未就绪或正在补缺口，仅保存历史记录")
                     # Transform callbacks cannot relabel the official source or
                     # rewrite the identity accepted at candle close.
                     signal.update({"symbol": symbol, "timeframe": timeframe, "close_time": close_time,
@@ -1741,6 +1930,30 @@ class MonitorService:
                 and self._timestamp_fresh(cached[2])):
             return cached[1]
         raise ValueError("WebSocket最优买卖价缺失或过期；不使用REST补查")
+
+    def execution_snapshot(self, symbol: str) -> dict:
+        """Verify current cached quotes; never rewrite an earlier signal's evidence."""
+        now=self.now();cached=self._book_cache.get(symbol);reasons=[];missing=[]
+        spread=cached[1] if cached and time.monotonic()-cached[0]<BOOK_TICKER_TTL_SECONDS and self._timestamp_fresh(cached[2]) else None
+        liquidity=self._base_enrichment(symbol).get('liquidity_percentile')
+        if spread is None:missing.append('当前最优买卖价缺失或已过期')
+        elif spread>8:reasons.append('当前价差超过0.08%')
+        bounds=None
+        if liquidity is None:
+            quote=self._metadata.get(symbol,{}).get('quoteAsset');ticker=self._ticker.get(symbol,{})
+            peers=[s for s,m in self._metadata.items() if quote and m.get('quoteAsset')==quote]
+            fresh=[self._ticker[s]['quote_volume'] for s in peers if self._timestamp_fresh(self._ticker.get(s,{}).get('time'))]
+            if len(peers)>1 and self._timestamp_fresh(ticker.get('time')):
+                value=ticker['quote_volume'];unknown=len(peers)-len(fresh)
+                bounds=[sum(v<value for v in fresh)/(len(peers)-1),(sum(v<=value for v in fresh)-1+unknown)/(len(peers)-1)]
+            if bounds and bounds[0]>=.4:pass
+            elif bounds and bounds[1]<.4:reasons.append('即使计入全部缺失合约，流动性分位仍低于40%')
+            else:missing.append('同报价币成交额覆盖不足，现有证据无法确定是否达到40%')
+        elif liquidity<.4:reasons.append('当前流动性分位低于40%')
+        return dict(symbol=symbol,checked_at=now,quote_time=cached[2] if spread is not None else None,
+                    spread_bps=spread,liquidity_percentile=liquidity,liquidity_bounds=bounds,reasons=reasons,missing=missing,
+                    status='不通过' if reasons else '待验证' if missing else '通过',
+                    basis='当前WebSocket缓存；仅验证现在，不覆盖历史盘口或历史评分')
 
     def _fence_reconnected_symbols(self, symbols: list[str]) -> None:
         """Block signals until each reconnected symbol proves continuity.
@@ -1832,6 +2045,20 @@ class MonitorService:
         except asyncio.CancelledError:
             raise
 
+    async def _fetch_missing_formal_range(self, symbol, timeframe, start, end):
+        interval = TIMEFRAME_MS[timeframe]
+        cached = await asyncio.to_thread(self.store.get_candles, symbol, timeframe,
+            (end-start)//interval+1, start=start, end=end)
+        cursor = start
+        for candle in cached:
+            if not candle.closed or not self._valid_candle(candle):
+                continue
+            if candle.open_time > cursor:
+                await self._fetch_range(symbol,timeframe,cursor,candle.open_time-1)
+            cursor = max(cursor,candle.open_time+interval)
+        if cursor <= end:
+            await self._fetch_range(symbol,timeframe,cursor,end)
+
     async def _recover_worker(self) -> None:
         while self._running:
             symbol = await self._gap_queue.get()
@@ -1868,7 +2095,7 @@ class MonitorService:
                     floor = range_start // interval * interval
                     closed_end = (end + 1) // interval * interval - 1
                     if floor <= closed_end:
-                        await self._fetch_range(symbol, timeframe, floor, closed_end)
+                        await self._fetch_missing_formal_range(symbol, timeframe, floor, closed_end)
                     target = LOOKBACK[timeframe]["days"] * DAY // interval + 3
                     # REST I/O stays outside the lock: otherwise slow repairs
                     # can occupy all three closed-candle workers.
@@ -2114,7 +2341,7 @@ class MonitorService:
                 and symbol not in self._reconnect_fence
                 and self._connections.get(self._symbol_shard.get(symbol, ""), {}).get("state") == "connected"
                 and self._timestamp_fresh(self._symbol_heartbeat.get(symbol))
-                and self._last_refresh > 0 and self.now() - self._last_refresh < 180_000)
+                and self._metadata_fresh())
 
     def _scope_counts(self) -> dict:
         metadata = list(self._metadata.values())
@@ -2217,15 +2444,13 @@ class MonitorService:
                       "gap_workers": GAP_WORKERS, "gap_queue": self._gap_queue.qsize(),
                       "kline_symbols_per_shard": KLINE_SYMBOLS_PER_SHARD,
                       "market_symbols_per_shard": KLINE_SYMBOLS_PER_SHARD,
-                      "market_streams_per_symbol": 1,
+                      "market_streams_per_symbol": 0, "mark_price_subscription_enabled": False,
                      "max_streams_per_connection": max(
                          [c.get("subscriptions", 0) for c in self._connections.values()] or [0]),
                      "pressure": "high" if (self._closed_queue.qsize() > 2000 or self._analysis_queue.qsize() > 2000
                          or self._candidate_queue.qsize() > 2000) else "warming" if self._warm_pending else "normal"}
         connections = [self._connection_snapshot(name, info) for name, info in self._connections.copy().items()]
         fresh_connections = sum(c["content_fresh"] for c in connections if c["name"].startswith("kline-"))
-        metadata_stream_fresh = any(
-            c["name"] == "market-control" and c["content_fresh"] for c in connections)
         state, message = self._state, self._message
         if state not in {"blocked", "error", "stopped", "connecting"}:
             if fresh_connections == 0:
@@ -2233,7 +2458,7 @@ class MonitorService:
             elif warming:
                 state, message = "warming", (f"历史窗口已补齐 {completed_pairs}/{len(states)}；"
                                              f"当前可监测 {sum(ready_by_tf.values())}/{len(states)} 个合约周期")
-            elif (errors or self._gap_pending or fresh_connections < math.ceil(len(symbols) / KLINE_SYMBOLS_PER_SHARD)
+            elif (self._maintenance_error or errors or self._gap_pending or fresh_connections < math.ceil(len(symbols) / KLINE_SYMBOLS_PER_SHARD)
                     or len(live_symbols) < len(symbols)):
                 state, message = "degraded", "部分合约行情或历史尚未就绪；缺口期间不生成正式信号"
             else:
@@ -2246,10 +2471,14 @@ class MonitorService:
                 "live_ready_symbols": sum(all(states[(s, tf)]["state"] == "ready" for tf in MONITOR_TIMEFRAMES) for s in live_symbols),
                 "live_ready_pairs": sum(live_ready_by_tf.values()), "timeframe_live_ready": live_ready_by_tf,
                 "timeframe_counts": timeframe_counts, "scope_verified": self._last_refresh > 0,
-                # exchangeInfo is intentionally not polled.  A fresh control
-                # stream is the continuing proof that listing/status changes
-                # are supervised after the initial REST snapshot.
-                "metadata_stale": not self._last_refresh or not metadata_stream_fresh,
+                # A fresh control stream supervises listing/status changes
+                # between conservative fifteen-minute metadata refreshes.
+                "metadata_stale": not self._metadata_fresh(),
+                "maintenance_error": self._maintenance_error,
+                "health_reasons": (["合约信息或时间校准维护正在重试"] if self._maintenance_error else []) + (["合约信息未确认或控制行情已过期"] if not self._metadata_fresh() else [])
+                    + ([f"{len(symbols)-len(live_symbols)} 个合约实时行情未就绪"] if len(live_symbols)<len(symbols) else [])
+                    + ([f"{insufficient} 个周期历史不足"] if insufficient else [])
+                    + ([f"{len(self._gap_pending)} 个合约存在行情缺口"] if self._gap_pending else []),
                 "warming_symbols": len(symbols) - ready_symbols, "timeframe_ready": ready_by_tf,
                 "timeframe_total": len(states), "ready_pairs": sum(ready_by_tf.values()),
                 "warming_pairs": warming, "insufficient_pairs": insufficient, "error_pairs": errors,

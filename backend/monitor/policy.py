@@ -15,7 +15,7 @@ class IndicatorSettings(BaseModel):
     # An empty list is an explicit raw-price strategy: activity and K-line
     # quality gates still apply, but no technical indicator confirmation is
     # required.  This is already supported by IndicatorConfig/evaluate_candidate.
-    enabled_indicators: list[Literal['supertrend','smc','ema']] = Field(default_factory=lambda:['supertrend','smc'], min_length=0, max_length=3)
+    enabled_indicators: list[Literal['wt_extreme_cross','nan_strategy1_oversold']] = Field(default_factory=lambda:['wt_extreme_cross'], min_length=0, max_length=2)
     confirmation_mode: Literal['all','any'] = 'all'
     atr_period: int = Field(10,ge=2,le=100)
     atr_multiplier: float = Field(3,ge=.5,le=10)
@@ -88,3 +88,14 @@ def apply_policy(signal, candles, settings: Settings):
     # Keep one heavy chart payload, not two aliases of the same context.
     result.pop('indicator_context',None)
     return result
+
+
+def migrate_saved_settings(values):
+    """Retired rule ids are pruned only when reading saved policy, never API input."""
+    from copy import deepcopy
+    values=deepcopy(values)
+    indicators=values.get('indicators',{})
+    ids=indicators.get('enabled_indicators')
+    if isinstance(ids,list):
+        indicators['enabled_indicators']=[i for i in ids if i not in ('supertrend','smc','ema')]
+    return values

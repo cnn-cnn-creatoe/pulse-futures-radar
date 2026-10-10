@@ -26,19 +26,25 @@ class ApiTests(unittest.TestCase):
         # Environment isolation happens BEFORE executing api.py: its module
         # initialization must never open the user's production database.
         self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
         self.environment = patch.dict(os.environ, {
             'PULSE_DATA_DIR': self.folder.name,
             'PULSE_DISABLE_COLLECTOR': '1',
         })
         self.environment.start()
+        self.addCleanup(self.environment.stop)
         self.start_patch = patch.object(MonitorService, 'start', side_effect=AssertionError('collector network must stay disabled'))
         self.start_mock = self.start_patch.start()
+        self.addCleanup(self.start_patch.stop)
         self.module_name = 'monitor._isolated_api_test'
         path = Path(__file__).resolve().parents[1] / 'monitor' / 'api.py'
         spec = importlib.util.spec_from_file_location(self.module_name, path)
         self.api = importlib.util.module_from_spec(spec)
         sys.modules[self.module_name] = self.api
         spec.loader.exec_module(self.api)
+        # Exercise a real instance lock without competing with the user's
+        # running backend. All API data already uses this isolated directory.
+        self.api.APPLICATION_ROOT = Path(self.folder.name)
         self.client = TestClient(self.api.app)
         self.client.__enter__()
 
@@ -49,6 +55,20 @@ class ApiTests(unittest.TestCase):
         self.environment.stop()
         sys.modules.pop(self.module_name, None)
         self.folder.cleanup()
+
+    def test_research_gateway_uses_shared_budget_and_preserves_columns(self):
+        from unittest.mock import AsyncMock
+        params=dict(symbol='BTCUSDT',interval='5m',startTime=0,endTime=299999)
+        self.assertEqual(self.client.get('/api/research/klines',params=params).status_code,403)
+        self.assertEqual(self.client.get('/api/research/klines',params=params,headers=HEADERS).status_code,503)
+        raw=[[0,'1','2','1','2','20',299999,'30',10,'12','18','0']]
+        with patch.object(self.api.service,'_running',True), patch.object(self.api.service,'_request',new_callable=AsyncMock,return_value=raw) as fetch:
+            response=self.client.get('/api/research/klines',params=params,headers=HEADERS)
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.json(),raw)
+            fetch.assert_awaited_once_with('/fapi/v1/klines',{**params,'limit':499},weight=2)
+        health=self.client.get('/api/status').json()['live_rules']
+        self.assertEqual(health['drop_reasons']['expired'],0)
 
     def test_demo_and_live_are_isolated_in_both_directions(self):
         self.assertEqual(self.client.get('/api/signals').json()['items'], [])
@@ -173,7 +193,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(asdict(self.api.service.config), changed)
         persisted = json.loads(self.api.CONFIG_FILE.read_text('utf-8'))
         self.assertEqual({key:persisted[key] for key in changed}, changed)
-        self.assertEqual(persisted['indicators']['enabled_indicators'], ['supertrend','smc'])
+        self.assertEqual(persisted['indicators']['enabled_indicators'], ['wt_extreme_cross'])
         self.assertEqual(persisted['quality']['min_activity_score'], 80)
         self.assertFalse(self.api.CONFIG_FILE.with_suffix('.tmp').exists())
         self.assertEqual(asdict(self.api.load_config()), changed)
@@ -233,6 +253,19 @@ class ApiTests(unittest.TestCase):
                      if isinstance(point, dict) and point.get('confirmed_at') is not None]
         self.assertTrue(confirmed)
         self.assertLessEqual(max(confirmed), cutoff)
+
+    def test_expired_signal_detail_never_rebuilds_snapshot_with_current_policy(self):
+        stamp = 1000
+        self.api.store.save_alert({'symbol': 'BTCUSDT', 'timeframe': '5m',
+            'close_time': stamp, 'candles': [{'close': 100, 'close_time': stamp}],
+            'policy_snapshot': {'old': True}})
+        self.api.store.prune(stamp + 31 * 86_400_000)
+        signal_id = f'BTCUSDT:5m:{stamp}:TWO_BAR_VOLATILITY'
+        with patch.object(self.api.store, 'get_candles', side_effect=AssertionError('expired evidence must not be rebuilt')):
+            response = self.client.get('/api/signals/' + quote(signal_id, safe=''))
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['item']['snapshot_expired'])
+        self.assertNotIn('indicators', response.json()['item'])
 
     def test_formal_history_chart_and_download_scope_is_only_five_and_fifteen_minutes(self):
         self.assertEqual(self.client.get('/api/chart/BTCUSDT/1m').status_code, 400)

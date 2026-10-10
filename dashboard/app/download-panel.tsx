@@ -1,4 +1,5 @@
 'use client';
+import { WorkspaceTabs } from './workspace-tabs';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
@@ -554,57 +555,7 @@ export function DownloadPanel({
           根；历史不足、缺口或未收盘时不生成正式信号。
         </span>
       </div>
-      <section className="panel active-downloads">
-        <div className="panel-heading">
-          <h2>
-            <Download size={16} />
-            当前下载任务
-          </h2>
-          <span className="muted">页面每 2 秒更新 · {stamp(updated)}</span>
-        </div>
-        <div className="active-job-grid">
-          {active.length ? (
-            active.map((j) => (
-              <button
-                key={j.symbol + j.timeframe}
-                className={
-                  symbol === j.symbol && tf === j.timeframe ? 'selected' : ''
-                }
-                onClick={() => choose(j.symbol, j.timeframe)}
-              >
-                <div>
-                  <b>{j.symbol}</b>
-                  <span>{j.timeframe}</span>
-                  <RefreshCw size={12} className="spin" />
-                </div>
-                <p>
-                  {n(j.bars)} / {n(j.target_bars)} 根{' '}
-                  <small>{n(j.progress_pct, 1)}%</small>
-                </p>
-                <div className="download-meter">
-                  <i
-                    style={{
-                      width:
-                        Math.max(0, Math.min(100, j.progress_pct || 0)) + '%',
-                    }}
-                  />
-                </div>
-                <small>
-                  已接收 {n(j.downloaded_bars || 0)} 根 · {n(j.pages || 0)} 批
-                </small>
-              </button>
-            ))
-          ) : (
-            <p className="download-empty-inline">
-              {data?.state === 'blocked'
-                ? '官方接口拒绝访问，保留已有数据等待恢复。'
-                : coins.length
-                  ? '当前没有正在请求的历史批次；请查看各币状态及下方日志。'
-                  : '正在读取合约范围和已有缓存，成功后自动开始下载。'}
-            </p>
-          )}
-        </div>
-      </section>
+      <WorkspaceTabs labels={['合约数据与下载','当前任务','下载日志']}>
       <div className="download-main-grid">
         <section className="panel coin-downloads">
           <div className="panel-heading">
@@ -972,6 +923,57 @@ export function DownloadPanel({
           </div>
         </section>
       </div>
+      <section className="panel active-downloads">
+        <div className="panel-heading">
+          <h2>
+            <Download size={16} />
+            当前下载任务
+          </h2>
+          <span className="muted">页面每 2 秒更新 · {stamp(updated)}</span>
+        </div>
+        <div className="active-job-grid">
+          {active.length ? (
+            active.map((j) => (
+              <button
+                key={j.symbol + j.timeframe}
+                className={
+                  symbol === j.symbol && tf === j.timeframe ? 'selected' : ''
+                }
+                onClick={() => choose(j.symbol, j.timeframe)}
+              >
+                <div>
+                  <b>{j.symbol}</b>
+                  <span>{j.timeframe}</span>
+                  <RefreshCw size={12} className="spin" />
+                </div>
+                <p>
+                  {n(j.bars)} / {n(j.target_bars)} 根{' '}
+                  <small>{n(j.progress_pct, 1)}%</small>
+                </p>
+                <div className="download-meter">
+                  <i
+                    style={{
+                      width:
+                        Math.max(0, Math.min(100, j.progress_pct || 0)) + '%',
+                    }}
+                  />
+                </div>
+                <small>
+                  已接收 {n(j.downloaded_bars || 0)} 根 · {n(j.pages || 0)} 批
+                </small>
+              </button>
+            ))
+          ) : (
+            <p className="download-empty-inline">
+              {data?.state === 'blocked'
+                ? '官方接口拒绝访问，保留已有数据等待恢复。'
+                : coins.length
+                  ? '当前没有正在请求的历史批次；请查看各币状态及下方日志。'
+                  : '正在读取合约范围和已有缓存，成功后自动开始下载。'}
+            </p>
+          )}
+        </div>
+      </section>
       <section className="panel download-log">
         <div className="panel-heading">
           <h2>
@@ -1046,6 +1048,7 @@ export function DownloadPanel({
           错误如实显示 · 页面刷新不停止后台下载 · 已下载数据不会因重连清空
         </div>
       </section>
+      </WorkspaceTabs>
     </div>
   );
 }

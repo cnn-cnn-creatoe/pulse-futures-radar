@@ -1,4 +1,17 @@
 'use client';
+import {passesStatisticsStrategy} from './strategy-statistics';
+import {INDICATOR_SHORTLIST} from './indicator-shortlist';
+import {LiveTradingWorkspace} from './live-trading';
+import {Wallet} from 'lucide-react';
+import {TimeframePicker} from './timeframe-picker';
+import { ChartCandlestick } from 'lucide-react';
+import {PatternPicker} from './pattern-picker';
+import {ActionabilityCell} from './score-cells';
+import {MarketChartButton,MarketChartHost} from './market-chart-button';
+import { MarketDashboard } from './market-dashboard';
+import { DataWorkspace } from './data-workspace';
+import { WorkspaceTabs } from './workspace-tabs';
+import './terminal-theme.css';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
@@ -12,7 +25,6 @@ import {
   Search,
   ChevronRight,
   ChevronLeft,
-  Star,
   Download,
   Pause,
   Play,
@@ -63,8 +75,13 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover';
 import { DownloadPanel } from './download-panel';
+import {SmcWorkspace} from './smc-workspace';
+import {PersonalRuleSettings} from './rule-delivery';
 import { TelegramSettingsPanel } from './telegram-settings';
 import { UpdateControl } from './update-panel';
+import { SymbolDayHistory, beijingDay } from './daily-history';
+import {useRuleSettings,passesRuleScores} from './rule-settings';
+import { ResearchWorkbench } from './workbench';
 import {
   CATEGORIES,
   categoryLabel,
@@ -76,7 +93,6 @@ import {
 } from './contract-meta';
 import {
   ADVANCED_DEFAULTS,
-  BacktestPanel,
   ConfirmationPanel,
   IndicatorSettingsPanel,
   positionView,
@@ -141,6 +157,7 @@ type Signal = SignalQuality &
     liquidity_peer_count?: number;
     spread_bps: number | null;
     activity_score: number;
+    actionability?: { execution_status?: string; missing?: string[]; score: number | null; label: string; blockers: string[]; explanation?: string; components?: Record<string, number> };
     daily_signal_date?: string;
     daily_signal_count?: number;
     daily_timeframe_signal_count?: number;
@@ -153,6 +170,7 @@ type Signal = SignalQuality &
     warnings: string[];
     baseline_samples: number;
     candles: Candle[];
+    snapshot_expired?: boolean;
     source?: string;
     available_confirmations?: {
       id: string;
@@ -162,8 +180,10 @@ type Signal = SignalQuality &
     }[];
   };
 type Status = {
+  live_rules?: { queue_depth:number; active:boolean; processed:number; dropped:number; errors:number; last_error:string|null; last_duration_ms:number|null; drop_reasons:Record<string,number> };
   state?: string;
   message?: string;
+  health_reasons?: string[];
   universe_count?: number;
   ready_symbols?: number;
   ready_pairs?: number;
@@ -181,29 +201,11 @@ type Settings = AdvancedSettings & {
   pattern_mode: string;
   allow_doji: boolean;
 };
-const TFS = ['5m', '15m'];
+const TFS = ['1s','1m','5m','15m','30m','1h','4h','1d','1w','1M'];
 const PATTERNS = ['阳阳', '阴阴', '阳阴', '阴阳'];
-type StrategyId = 'supertrend' | 'smc';
+type StrategyId = string;
 type StrategyMode = 'all' | 'any';
-const STRATEGIES: {
-  id: StrategyId;
-  short: string;
-  name: string;
-  help: string;
-}[] = [
-  {
-    id: 'supertrend',
-    short: '指标1',
-    name: '超级趋势',
-    help: '用平均真实波幅判断趋势方向；反转形态要求近期发生同向翻转。',
-  },
-  {
-    id: 'smc',
-    short: '指标2',
-    name: '智慧资金市场结构',
-    help: '用已确认的结构突破、结构转折以及支撑阻力判断方向和空间。',
-  },
-];
+type Shortcut = {id:string;short?:string;name:string;help:string;family?:string;likes?:number;year?:{win_rate?:number;trades:number}};
 const DESCRIPTIONS = ['连续向上', '连续向下', '冲高回落', '下探反弹'];
 const BASELINE = [
   ['5m', '7 天', '864'],
@@ -507,22 +509,25 @@ function FilterSelect({
   );
 }
 function StrategyFilter({
+  options:STRATEGIES, api, onSlots, onSmc,
   selected,
   mode,
   onChange,
   onModeChange,
 }: {
+  options:Shortcut[];api:string|null;onSlots:(items:Shortcut[])=>void;onSmc:()=>void;
   selected: StrategyId[];
   mode: StrategyMode;
   onChange: (value: StrategyId[]) => void;
   onModeChange: (value: StrategyMode) => void;
 }) {
+  const [popoverOpen,setPopoverOpen]=useState(false);
   const label = selected.length
     ? selected
         .map((id) => STRATEGIES.find((item) => item.id === id)?.short)
         .filter(Boolean)
         .join(' + ')
-    : '空策略';
+    : '不选指标';
   const toggle = (id: StrategyId) =>
     onChange(
       selected.includes(id)
@@ -530,17 +535,18 @@ function StrategyFilter({
         : [...selected, id],
     );
   return (
-    <Popover>
+    <>
+    <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
       <PopoverTrigger
         render={
           <button
             type="button"
             className={'strategy-filter ' + (selected.length ? 'active' : '')}
             aria-label="选择指标策略"
-            title="活跃度与策略分开计算；空策略只按活跃度和两根 K 线筛选"
+            title="活跃度与策略分开计算；不选指标只按活跃度和两根 K 线筛选"
           >
             <Layers3 size={14} />
-            <span>策略：{label}</span>
+            <span>指标策略：{label}</span>
             <ChevronDown size={13} />
           </button>
         }
@@ -549,22 +555,11 @@ function StrategyFilter({
         <PopoverHeader>
           <PopoverTitle>选择指标策略</PopoverTitle>
           <PopoverDescription>
-            活跃度不绑定指标。空策略保留更多两 K 候选；单选或多选只过滤当前列表。
+            WaveTrend 用于下方异常记录筛选；美股 SMC 可在这里打开自选币种、周期与 Telegram 盘中提醒。
           </PopoverDescription>
         </PopoverHeader>
-        <button
-          type="button"
-          className={'strategy-option ' + (!selected.length ? 'active' : '')}
-          onClick={() => onChange([])}
-        >
-          <span className="strategy-check">{!selected.length && <Check size={13} />}</span>
-          <span>
-            <b>空策略</b>
-            <small>只看活跃度与两根 K 线形态，候选最多</small>
-          </span>
-        </button>
         {STRATEGIES.map((item) => (
-          <button
+          <div key={item.id}><button
             type="button"
             key={item.id}
             className={
@@ -582,8 +577,12 @@ function StrategyFilter({
               </b>
               <small>{item.help}</small>
             </span>
-          </button>
+          </button></div>
         ))}
+        <button type="button" className="strategy-option" onClick={()=>{setPopoverOpen(false);onSmc();}}>
+          <span className="strategy-check"><Layers3 size={13}/></span>
+          <span><b>美股 SMC · 盘中结构提醒</b><small>搜索或勾选全部美股列表 · 自选周期 · BOS / CHoCH 实时推送</small></span><ChevronRight size={14}/>
+        </button>
         {selected.length > 1 && (
           <div className="strategy-mode" aria-label="多指标组合方式">
             <button
@@ -607,6 +606,8 @@ function StrategyFilter({
         </p>
       </PopoverContent>
     </Popover>
+
+    </>
   );
 }
 function PatternIcon({ pattern }: { pattern: string }) {
@@ -1135,7 +1136,9 @@ function CandleChart({
   return (
     <div className="chart-workbench">
       <p className="simple-chart-note">
-        图中仅显示已收盘 K 线与两根 K 线形态；超级趋势和智慧资金市场结构只参与后台判断。
+        {signal.snapshot_expired
+          ? '该信号已超过 30 天，保留摘要；原始图表快照已清理。需要回测时，请先下载对应日期的历史行情。'
+          : '图中仅显示已收盘 K 线与两根 K 线形态；超级趋势和智慧资金市场结构只参与后台判断。'}
       </p>
       <div
         className="candle-chart"
@@ -1150,6 +1153,10 @@ function CandleChart({
 }
 export default function Home() {
   const [view, setView] = useState('overview');
+  const [recordStrategy,setRecordStrategy]=useState('wt');
+  useEffect(()=>{try{if(localStorage.getItem('pulse-record-strategy')==='smc')setRecordStrategy('smc');}catch{}},[]);
+  const chooseRecordStrategy=(next:string)=>{setRecordStrategy(next);try{localStorage.setItem('pulse-record-strategy',next);}catch{}};
+  const [ruleSettings]=useRuleSettings();
   const [mode, setMode] = useState<'demo' | 'live'>('live');
   const [demo, setDemo] = useState<Signal[]>([]);
   const [live, setLive] = useState<Signal[]>([]);
@@ -1163,17 +1170,28 @@ export default function Home() {
   const refreshing = useRef(false);
   const [lastSync, setLastSync] = useState<number>();
   const [selectedId, setSelectedId] = useState('');
-  const [pattern, setPattern] = useState('all');
-  const [timeframe, setTimeframe] = useState('all');
+  const [detailOverride, setDetailOverride] = useState<Signal | null>(null);
+  const [pattern, setPattern] = useState<string[]>([]);
+  const [timeframe, setTimeframe] = useState<string[]>(['5m','15m']);
+  const [periodMessage,setPeriodMessage] = useState('');
   const [query, setQuery] = useState('');
-  const [minScore, setMinScore] = useState('65');
+  const [minScore, setMinScore] = useState('0');
+  const [minAction,setMinAction]=useState('0');
+  const [executionOnly,setExecutionOnly]=useState('all');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [dateFilter, setDateFilter] = useState('all');
-  const [onlyStars, setOnlyStars] = useState(false);
+  const [today, setToday] = useState(beijingDay);
+  const [historyDay, setHistoryDay] = useState('');
+  const [symbolHistory, setSymbolHistory] = useState<{symbol: string; date: string} | null>(null);
+  const recordDay = view === 'history' && historyDay ? historyDay : today;
+  const feed = useRef({ date: '', cursor: 0 });
+  const activeRecordDay = useRef(recordDay);
+  activeRecordDay.current = recordDay;
   const [onlyQualified, setOnlyQualified] = useState(false);
-  const [selectedStrategies, setSelectedStrategies] = useState<StrategyId[]>([]);
+  const [selectedStrategies, setSelectedStrategies] = useState<StrategyId[]>(['wt_extreme_cross']);
+  const [STRATEGIES,setShortcutSlots]=useState<Shortcut[]>(INDICATOR_SHORTLIST.filter(i=>i.id==='wt_extreme_cross'));
+  useEffect(()=>{if(!api)return;let cancelled=false;const load=()=>fetch(api+'/api/workbench/shortcuts').then(r=>r.ok?r.json() as Promise<{items:Shortcut[]}>:Promise.reject()).then(d=>{if(!cancelled){setShortcutSlots(d.items.filter(i=>i.id==='wt_extreme_cross'));}}).catch(()=>{});void load();const timer=setInterval(()=>void load(),15000);return()=>{cancelled=true;clearInterval(timer);};},[api]);
   const [strategyMode, setStrategyMode] = useState<StrategyMode>('all');
-  const [stars, setStars] = useState<string[]>([]);
   const [paused, setPaused] = useState(false);
   const [sorting, setSorting] = useState<SortingState>([
     { id: 'close_time', desc: true },
@@ -1192,10 +1210,10 @@ export default function Home() {
     setToast(message);
     window.setTimeout(() => setToast(''), 4200);
   };
-  const updateStrategySelection = useCallback((next: StrategyId[]) => {
-    setSelectedStrategies(next);
+  const updateStrategySelection = useCallback((_next: StrategyId[]) => {
+    setSelectedStrategies(['wt_extreme_cross']);
     try {
-      localStorage.setItem('pulse-signal-strategies', JSON.stringify(next));
+      localStorage.setItem('pulse-signal-strategies', JSON.stringify(['wt_extreme_cross']));
     } catch {}
   }, []);
   const updateStrategyMode = useCallback((next: StrategyMode) => {
@@ -1221,6 +1239,8 @@ export default function Home() {
       window.location.replace(cleanOrigin.toString());
       return;
     }
+    if(new URLSearchParams(window.location.search).get('view')==='smc')setView('smc');
+    if (['quant','history','indicator','indicator-strategy'].includes(new URLSearchParams(window.location.search).get('view')||'')) setView('history');
     if (new URLSearchParams(window.location.search).get('view') === 'downloads')
       setView('universe');
     if (host === 'localhost') {
@@ -1232,20 +1252,7 @@ export default function Home() {
       setMode('live');
     }
     try {
-      const saved = JSON.parse(localStorage.getItem('pulse-watchlist') || '[]');
-      if (Array.isArray(saved))
-        setStars(saved.filter((x) => typeof x === 'string'));
-    } catch {}
-    try {
-      const savedStrategies = JSON.parse(
-        localStorage.getItem('pulse-signal-strategies') || '[]',
-      );
-      if (Array.isArray(savedStrategies))
-        setSelectedStrategies(
-          savedStrategies.filter((item): item is StrategyId =>
-            STRATEGIES.some((strategy) => strategy.id === item),
-          ),
-        );
+      setSelectedStrategies(['wt_extreme_cross']);
       const savedMode = localStorage.getItem('pulse-signal-strategy-mode');
       if (savedMode === 'all' || savedMode === 'any')
         setStrategyMode(savedMode);
@@ -1257,7 +1264,7 @@ export default function Home() {
       if (savedLayers && typeof savedLayers === 'object')
         setChartLayers({ ...DEFAULT_CHART_LAYERS, ...savedLayers });
     } catch {}
-    const tick = () => setClock(stamp(Date.now()) + ' UTC+8');
+    const tick = () => { setClock(stamp(Date.now()) + ' UTC+8'); setToday(beijingDay()); };
     tick();
     const timer = setInterval(tick, 1000);
     fetch('/demo-signals.json')
@@ -1303,21 +1310,26 @@ export default function Home() {
       }
       if (!paused) {
         try {
-          const data = await fetch(
-            api + '/api/signals?mode=live&limit=1000&include_candles=false',
-            {
-              signal: AbortSignal.timeout(8000),
-            },
-          );
-          if (!data.ok) throw Error();
-          const incoming = ((await data.json()) as { items: Signal[] }).items;
-          // Stored alerts are immutable. Retain hydrated detail and chart identity.
-          setLive((previous) => {
-            const existing = new Map(previous.map((s) => [s.id, s]));
-            return incoming.map(
-              (s) => existing.get(s.id) || { ...s, candles: [] },
-            );
-          });
+          if (feed.current.date !== recordDay) {
+            feed.current = { date: recordDay, cursor: 0 };
+            setLive([]);
+          }
+          let more = true;
+          while (more && activeRecordDay.current === recordDay) {
+            const data = await fetch(`${api}/api/daily-records?date=${recordDay}&after=${feed.current.cursor}`, {
+              signal: AbortSignal.timeout(30000),
+            });
+            if (!data.ok) throw Error();
+            const incoming = await data.json() as { items: Signal[]; cursor: number; has_more: boolean };
+            if (activeRecordDay.current !== recordDay) return;
+            if (incoming.items.length) setLive(previous => {
+              const existing = new Map(previous.map(s => [s.id, s]));
+              for (const s of incoming.items) if (!existing.has(s.id)) existing.set(s.id, { ...s, candles: [] });
+              return [...existing.values()];
+            });
+            feed.current.cursor = incoming.cursor;
+            more = incoming.has_more;
+          }
           setLastSync(Date.now());
           setSignalError('');
         } catch {
@@ -1329,7 +1341,7 @@ export default function Home() {
     } finally {
       refreshing.current = false;
     }
-  }, [api, paused]);
+  }, [api, paused, recordDay]);
   useEffect(() => {
     refresh();
     const t = setInterval(refresh, 5000);
@@ -1356,40 +1368,37 @@ export default function Home() {
       })
       .catch(() => {});
   }, [api, apiOnline]);
-  const toggleStar = useCallback(
-    (symbol: string) =>
-      setStars((previous) => {
-        const next = previous.includes(symbol)
-          ? previous.filter((s) => s !== symbol)
-          : [...previous, symbol];
-        try {
-          localStorage.setItem('pulse-watchlist', JSON.stringify(next));
-        } catch {}
-        return next;
-      }),
-    [],
-  );
+  useEffect(()=>{if(!api||mode!=='live')return;let active=true;const send=async()=>{try{const r=await fetch(api+'/api/market-periods',{method:'POST',headers:{'Content-Type':'application/json','X-Pulse-Client':'dashboard'},body:JSON.stringify({timeframes:timeframe})});const data=await r.json() as {message?:string;detail?:string};if(active)setPeriodMessage(r.ok?data.message||'':data.detail||'周期补数失败');}catch{if(active)setPeriodMessage('周期服务暂不可用');}};void send();const timer=setInterval(()=>void send(),30000);return()=>{active=false;clearInterval(timer);};},[api,mode,timeframe]);
   const source = useMemo(
-    () =>
-      (mode === 'demo' ? demo : live).filter(
-        (s) => quote(s) === 'USDT' && TFS.includes(s.timeframe),
-      ),
-    [mode, demo, live],
+    () => {
+      const rows = (mode === 'demo' ? demo : live).filter(
+        (s) => passesStatisticsStrategy(s) && quote(s) === 'USDT' && TFS.includes(s.timeframe) &&
+          (mode === 'demo' || new Date(s.close_time + 8 * 3600000).toISOString().slice(0, 10) === recordDay),
+      );
+      if (mode === 'demo') return rows;
+      const counts = new Map<string, number>();
+      for (const s of rows) {
+        for (const key of [s.symbol, `${s.symbol}:${s.timeframe}`, `${s.symbol}:${s.direction}`]) counts.set(key, (counts.get(key) || 0) + 1);
+      }
+      return rows.map(s => ({ ...s, daily_signal_date: recordDay, daily_signal_count: counts.get(s.symbol),
+        daily_timeframe_signal_count: counts.get(`${s.symbol}:${s.timeframe}`), daily_direction_signal_count: counts.get(`${s.symbol}:${s.direction}`) }));
+    },
+    [mode, demo, live, recordDay],
   );
-  const filtered = useMemo(
+  const beforeIndicator = useMemo(
     () =>
       source.filter(
         (s) =>
           (mode === 'demo' ||
             !onlyQualified ||
             (s.qualified === true && s.quality_schema_version === 2)) &&
-          (pattern === 'all' || s.pattern === pattern) &&
-          (timeframe === 'all' || s.timeframe === timeframe) &&
+          (!pattern.length || pattern.includes(s.pattern)) &&
+          timeframe.includes(s.timeframe) &&
           s.symbol.toLowerCase().includes(query.trim().toLowerCase()) &&
-          s.activity_score >= Number(minScore) &&
-          strategyPasses(s, selectedStrategies, strategyMode) &&
+          (minScore === '0' || s.activity_score / availableActivityMax(s) * 100 >= Number(minScore)) &&
+          (minAction === '0' || (s.actionability?.score != null && s.actionability.score >= Number(minAction))) &&
+          (executionOnly === 'all' || s.actionability?.execution_status === '通过') &&
           matchesCategory(s, categoryFilter) &&
-          (!onlyStars || stars.includes(s.symbol)) &&
           (dateFilter === 'all' ||
             s.close_time >= Date.now() - Number(dateFilter) * 86400000),
       ),
@@ -1401,20 +1410,25 @@ export default function Home() {
       timeframe,
       query,
       minScore,
+      minAction,
+      executionOnly,
       selectedStrategies,
       strategyMode,
       categoryFilter,
-      onlyStars,
-      stars,
       dateFilter,
     ],
   );
-  const selected = filtered.find((s) => s.id === selectedId) || filtered[0];
+  const filtered = useMemo(() => beforeIndicator.filter(s=>strategyPasses(s,selectedStrategies,strategyMode)&&selectedStrategies.every(id=>passesRuleScores(s,ruleSettings[id]))),[beforeIndicator,selectedStrategies,strategyMode,ruleSettings]);
+  const confirmationMissing = useMemo(() => selectedStrategies.length ? beforeIndicator.filter(s=>{
+    const known=new Set(confirmationList(s).filter(c=>!('ready' in c)||c.ready!==false).map(c=>c.id));
+    return selectedStrategies.some(id=>!known.has(id));
+  }).length : 0,[beforeIndicator,selectedStrategies]);
+  const selected = detailOverride || filtered.find((s) => s.id === selectedId) || filtered[0];
   const [detailFailure, setDetailFailure] = useState('');
   const [detailRetry, setDetailRetry] = useState(0);
   useEffect(() => {
     setDetailFailure('');
-    if (!api || mode !== 'live' || !selected || selected.candles?.length)
+    if (!api || mode !== 'live' || !selected || selected.candles?.length || selected.snapshot_expired)
       return;
     const controller = new AbortController();
     const timeout = setTimeout(() => {
@@ -1429,9 +1443,10 @@ export default function Home() {
         if (!r.ok) throw Error();
         return r.json() as Promise<{ item: Signal }>;
       })
-      .then(({ item }) =>
-        setLive((previous) => previous.map((s) => (s.id === id ? item : s))),
-      )
+      .then(({ item }) => {
+        setLive((previous) => previous.map((s) => (s.id === id ? item : s)));
+        setDetailOverride(previous => previous?.id === id ? item : previous);
+      })
       .catch(() => {
         if (!controller.signal.aborted) setDetailFailure('K 线详情加载失败');
       })
@@ -1440,7 +1455,7 @@ export default function Home() {
       controller.abort();
       clearTimeout(timeout);
     };
-  }, [api, mode, selected?.id, selected?.candles?.length, detailRetry]);
+  }, [api, mode, selected?.id, selected?.candles?.length, selected?.snapshot_expired, detailRetry]);
   const patternCounts = PATTERNS.map(
     (p) => source.filter((s) => s.pattern === p).length,
   );
@@ -1452,8 +1467,11 @@ export default function Home() {
     String(status.message || '').includes('451');
   const heading: Record<string, string> = {
     overview: '市场总览',
-    history: '信号记录',
-    universe: '行情下载与新币',
+    smc: '美股 SMC',
+    history: '指标策略',
+    quant: '指标策略',
+    trading: '实盘交易',
+    universe: '历史行情与下载',
     backtest: '历史回测',
     rules: '监测规则',
     system: '系统与推送',
@@ -1462,16 +1480,18 @@ export default function Home() {
     ? '在线演示版'
     : !apiOnline
       ? '本地服务离线'
+      : Number(status.rest_cooldown_seconds)>0 && !connected
+        ? `访问冷却中 · ${Math.ceil(Number(status.rest_cooldown_seconds))}秒`
       : blocked
         ? '行情访问受限'
         : connected
           ? '行情监测中'
           : status.state === 'warming'
-            ? '历史数据预热中'
+            ? '数据正在持续补齐中'
             : (
                 {
                   reconnecting: '行情重连中',
-                  degraded: '部分数据补齐中',
+                  degraded: '部分行情未就绪',
                   stopped: '采集已停止',
                   error: '行情连接失败',
                 } as Record<string, string>
@@ -1479,59 +1499,43 @@ export default function Home() {
   const columns = useMemo<ColumnDef<Signal>[]>(
     () => [
       {
-        id: 'favorite',
-        header: '',
-        cell: ({ row }) => (
-          <button
-            className={
-              'star-button ' +
-              (stars.includes(row.original.symbol) ? 'is-starred' : '')
-            }
-            aria-label={
-              (stars.includes(row.original.symbol) ? '取消关注 ' : '关注 ') +
-              row.original.symbol
-            }
-            onClick={(e) => {
-              e.stopPropagation();
-              toggleStar(row.original.symbol);
-            }}
-          >
-            <Star size={13} />
-          </button>
-        ),
-        enableSorting: false,
-      },
-      {
         accessorKey: 'symbol',
         header: '交易对',
         cell: ({ row }) => (
           <div className="symbol-cell">
             <Coin symbol={row.original.symbol} />
             <div>
-              <b>
+              <button type="button" className="symbol-history-button" title="点击复制交易对" aria-label={`复制 ${row.original.symbol}`} onClick={async e => { e.stopPropagation(); try { await navigator.clipboard.writeText(row.original.symbol); notify(`已复制 ${row.original.symbol}`); } catch { notify('复制失败，请手动选中币名复制'); } }}><b>
                 {row.original.symbol.includes('_')
                   ? row.original.symbol
                   : asset(row.original)}
-              </b>
+              </b></button>
               <small>
                 {quote(row.original)} · {contractLabel(row.original)}
               </small>
               <small>{categoryLabel(row.original)}</small>
-              <small
+              <button type="button"
+                onClick={e => { e.stopPropagation(); if (mode === 'live') setSymbolHistory({ symbol: row.original.symbol, date: row.original.daily_signal_date || recordDay }); }}
                 className="symbol-daily-count"
                 title={
                   row.original.daily_signal_count == null
                     ? '演示样本或旧接口暂未提供今日统计'
-                    : `北京时间 ${row.original.daily_signal_date || '当日'}：本合约写入系统的原始异常共 ${row.original.daily_signal_count} 次；其中 ${row.original.timeframe} 周期 ${row.original.daily_timeframe_signal_count ?? 0} 次，同方向 ${row.original.daily_direction_signal_count ?? 0} 次。北京时间次日 00:00 重新计数。`
+                    : `北京时间 ${row.original.daily_signal_date || '当日'}：本合约通过 WaveTrend 超买超卖交叉的信号共 ${row.original.daily_signal_count} 次；其中 ${row.original.timeframe} 周期 ${row.original.daily_timeframe_signal_count ?? 0} 次，同方向 ${row.original.daily_direction_signal_count ?? 0} 次。北京时间次日 00:00 重新计数。`
                 }
               >
                 {row.original.daily_signal_count == null
                   ? '今日次数 —'
-                  : `今日 ${row.original.daily_signal_count} 次`}
-              </small>
+                  : `${recordDay === today ? '今日' : '当日'} ${row.original.daily_signal_count} 次 · 查看全部`}
+              </button>
             </div>
           </div>
         ),
+      },
+      {
+        id: 'detail',
+        header: '图表',
+        cell: ({row}) => <MarketChartButton api={api} symbol={row.original.symbol} timeframe={row.original.timeframe} time={row.original.close_time} initialRule="indicator:wt_extreme_cross"/>,
+        enableSorting: false,
       },
       {
         accessorKey: 'timeframe',
@@ -1585,7 +1589,7 @@ export default function Home() {
                   (id) => STRATEGIES.find((item) => item.id === id)?.name || id,
                 )
                 .join(strategyMode === 'all' ? ' + ' : ' / ')}筛选。`
-            : '当前为空策略，仅按活跃度与两根 K 线形态显示。';
+            : '当前为不选指标，仅按活跃度与两根 K 线形态显示。';
           const explanation = `${strategyText}${
             fullQuality
               ? '全部质量与空间门槛也已通过。'
@@ -1676,10 +1680,19 @@ export default function Home() {
         ),
       },
       {
+        id: 'actionability',
+        accessorFn: (s) => s.actionability?.score ?? -1,
+        header: () => <span title="结构、成本后空间、时机和止损距离评分；盘口另行验证。分数不是胜率">可做度</span>,
+        cell: ({ row }) => {
+          const a = row.original.actionability;
+          return <ActionabilityCell value={a} api={api} symbol={row.original.symbol}/>;
+        },
+      },
+      {
         accessorKey: 'activity_score',
         header: () => (
           <span title="成交额、价格结构、主动买卖、持仓量与流动性构成的可用信息分数；缺失项不会伪造补分">
-            活跃度
+            活跃原分
           </span>
         ),
         cell: ({ row }) => (
@@ -1696,7 +1709,7 @@ export default function Home() {
                         100,
                     ) + '%',
                   background:
-                    row.original.activity_score >= 80 ? '#4bdac1' : '#738ad5',
+                    row.original.activity_score / availableActivityMax(row.original) >= .8 ? '#4bdac1' : '#738ad5',
                 }}
               />
             </div>
@@ -1704,7 +1717,7 @@ export default function Home() {
               className="muted"
               title="分母是本条记录实际具备的数据满分；缺失项不会补造"
             >
-              /{availableActivityMax(row.original)}
+              /{availableActivityMax(row.original)} · {Math.round(row.original.activity_score/availableActivityMax(row.original)*100)}%
             </span>
           </div>
         ),
@@ -1718,31 +1731,8 @@ export default function Home() {
           </span>
         ),
       },
-      {
-        id: 'detail',
-        header: '',
-        cell: ({ row }) => (
-          <button
-            className="row-detail"
-            aria-label={
-              '查看 ' +
-              row.original.symbol +
-              ' ' +
-              row.original.timeframe +
-              ' 信号详情'
-            }
-            onClick={() => {
-              setSelectedId(row.original.id);
-              setView('overview');
-            }}
-          >
-            <ChevronRight size={16} />
-          </button>
-        ),
-        enableSorting: false,
-      },
     ],
-    [stars, toggleStar, selectedStrategies, strategyMode],
+    [selectedStrategies, strategyMode, mode, recordDay, today, api],
   );
   const table = useReactTable({
     data: filtered,
@@ -1755,12 +1745,11 @@ export default function Home() {
     initialState: { pagination: { pageSize: 8 } },
   });
   function resetFilters() {
-    setPattern('all');
-    setTimeframe('all');
+    setPattern([]);
+    setTimeframe(['5m','15m']);
     setQuery('');
-    setMinScore('65');
+    setMinScore('0'); setMinAction('0'); setExecutionOnly('all');
     setCategoryFilter('all');
-    setOnlyStars(false);
     setDateFilter('all');
     updateStrategySelection([]);
     updateStrategyMode('all');
@@ -1827,7 +1816,7 @@ export default function Home() {
           ? selectedStrategies
               .map((id) => STRATEGIES.find((item) => item.id === id)?.name)
               .join('+')
-          : '空策略';
+          : '不选指标';
       if (key === 'strategy_mode')
         return selectedStrategies.length > 1
           ? strategyMode === 'all'
@@ -1854,7 +1843,7 @@ export default function Home() {
     const a = document.createElement('a');
     a.href = url;
     a.download =
-      'PULSE-' + mode + '-' + new Date().toISOString().slice(0, 10) + '.csv';
+      '合约推送-' + mode + '-' + new Date().toISOString().slice(0, 10) + '.csv';
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 500);
     notify(
@@ -1904,7 +1893,7 @@ export default function Home() {
           </h2>
           <span className="count-pill">{filtered.length}</span>
           <span className="muted desktop-only">
-            活跃度独立计分 · 当前{selectedStrategies.length ? '已选指标' : '为空策略'}
+            活跃度独立计分 · 当前{selectedStrategies.length ? '已选指标' : '为不选指标'}
           </span>
         </div>
         <div className="table-actions">
@@ -1961,38 +1950,26 @@ export default function Home() {
             placeholder="搜索 BTC / TSLA / XAU / 260925"
           />
         </div>
+        <div className="fixed-filter-group"><TimeframePicker compact value={timeframe} onChange={setTimeframe}/>
+        {periodMessage&&<small title={periodMessage}>{periodMessage}</small>}
+        <PatternPicker value={pattern} onChange={setPattern}/></div>
+        <div className="screening-grid"><button onClick={()=>{setDetailOverride(null);setView('history');}}>指标策略</button></div>
         <FilterSelect
-          label="筛选周期"
-          hint="选择 K 线周期；每个周期使用各自的历史基准和最低异常倍数。"
-          value={timeframe}
-          onChange={setTimeframe}
-          items={[
-            ['all', '全部（5m / 15m）'],
-            ...TFS.map((x) => [x, x] as [string, string]),
-          ]}
-        />
-        <FilterSelect
-          label="筛选形态"
-          hint="阳阳/阴阴用于趋势延续检查；阴阳/阳阴用于方向反转检查。"
-          value={pattern}
-          onChange={setPattern}
-          items={[
-            ['all', '全部形态'],
-            ...PATTERNS.map((x) => [x, x] as [string, string]),
-          ]}
-        />
-        <FilterSelect
-          label="最低活跃度"
-          hint="活跃度独立于指标，由成交额、价格结构、主动买卖、持仓与流动性组成；这里只过滤页面显示。"
+          label="活跃度 · 可用项占比"
+          hint="按原分÷实际可用满分过滤，例如 65/77=84.4%；缺失项不会补造。占比不是胜率，也不会改变后台正式信号门槛。"
           value={minScore}
           onChange={setMinScore}
           items={[
             ['0', '全部活跃度'],
-            ['65', '活跃 ≥65（默认）'],
-            ['80', '强活跃 ≥80'],
-            ['90', '极强 ≥90'],
+            ['65', '可用项 ≥65%'],
+            ['80', '可用项 ≥80%'],
+            ['90', '可用项 ≥90%'],
           ]}
         />
+        <FilterSelect label="可做度 · 结构分" hint="与活跃度独立：空间、时机、止损距离和趋势的规则评分；60%不是60%胜率。缺结构数据不会通过分数筛选。" value={minAction} onChange={setMinAction} items={[
+          ['0','全部可做度'],['40','结构分 ≥40%'],['60','结构分 ≥60%'],['70','结构分 ≥70%'],['80','结构分 ≥80%'],['90','结构分 ≥90%']]}/>
+        <FilterSelect label="盘口验证" hint="历史缺少价差或流动性快照时显示待验证；不会用当前盘口补造。通过也不代表可保证成交。" value={executionOnly} onChange={setExecutionOnly} items={[
+          ['all','全部盘口状态'],['verified','仅盘口验证通过']]}/>
         <FilterSelect
           label="资产类别"
           hint="按币安官方合约元数据区分加密资产、股票、商品、指数等类别。"
@@ -2000,38 +1977,27 @@ export default function Home() {
           onChange={setCategoryFilter}
           items={CATEGORIES}
         />
-        <StrategyFilter
+        <StrategyFilter onSmc={()=>{setDetailOverride(null);chooseRecordStrategy('smc');}}
           selected={selectedStrategies}
+          options={STRATEGIES} api={api} onSlots={setShortcutSlots}
           mode={strategyMode}
           onChange={updateStrategySelection}
           onModeChange={updateStrategyMode}
         />
-        {view === 'history' && (
-          <FilterSelect
-            label="日期范围"
-            value={dateFilter}
-            onChange={setDateFilter}
-            items={[
-              ['all', '全部日期'],
-              ['1', '最近 24 小时'],
-              ['7', '最近 7 天'],
-            ]}
-          />
-        )}
-        <Button
-          className={onlyStars ? 'star-filter active' : 'star-filter'}
-          variant="ghost"
-          size="icon"
-          onClick={() => setOnlyStars((v) => !v)}
-          aria-pressed={onlyStars}
-          aria-label="仅看关注"
-        >
-          <Star />
-        </Button>
+        {(view === 'history' || view === 'quant') && <label className="daily-date-control">日期<input type="date" value={recordDay} max={today}
+          onChange={e => { setHistoryDay(e.target.value); setDateFilter('all'); }} /></label>}
+
         <Button variant="ghost" size="sm" onClick={resetFilters}>
           重置
         </Button>
       </div>
+      {mode === 'live' && <p className="daily-feed-note">{recordDay}（北京时间）已载入 {source.length.toLocaleString()} 条，当前筛选显示 {filtered.length.toLocaleString()} 条。仅统计 WaveTrend 超买超卖交叉确认通过的信号。点击币名复制交易对，点击旁边“查看图表”打开 K 线，点击“今日次数”查看该币当天策略记录。次日零点候选换为新一天；最近 30 天记录可在历史回测中导出每日 CSV，更早的信号保留摘要。</p>}
+      {selectedStrategies.length>0&&<div className="daily-feed-note" role="status">
+        <p>这里是异常记录的指标确认筛选，不是全部指标买卖点。当前周期、形态、结构分等其他条件筛选后剩 {beforeIndicator.length.toLocaleString()} 条；再要求指标同根收盘、同方向{strategyMode==='all'?'全部':'任一'}触发，剩 {filtered.length.toLocaleString()} 条。{confirmationMissing>0&&`其中 ${confirmationMissing.toLocaleString()} 条缺少所选指标的完整确认记录，无法据此判断是否触发。`}</p>
+        <p>点击图表默认显示该条记录的周期及 WaveTrend 超买超卖交叉信号；图中指标触发点不自动应用这里的结构分门槛。</p>
+        <Button variant="outline" size="sm" onClick={()=>{setDetailOverride(null);setView('history');}}>查看独立指标策略</Button>
+        {minAction!=='0'&&<Button variant="outline" size="sm" onClick={()=>setMinAction('0')}>取消结构分 ≥{minAction}% 筛选</Button>}
+      </div>}
       <Table>
         <TableHeader>
           {table.getHeaderGroups().map((group) => (
@@ -2079,7 +2045,7 @@ export default function Home() {
             <TableRow
               key={row.original.id}
               className={selected?.id === row.original.id ? 'selected-row' : ''}
-              onClick={() => setSelectedId(row.original.id)}
+              onClick={() => { setDetailOverride(null); setSelectedId(row.original.id); }}
             >
               {row.getVisibleCells().map((cell) => (
                 <TableCell key={cell.id}>
@@ -2127,7 +2093,7 @@ export default function Home() {
           )}{' '}
           条，共 {filtered.length} 条{' '}
           <span className="muted">
-            · {mode === 'demo' ? '固定演示样本' : '最新 1,000 条以内'} · UTC+8
+            · {mode === 'demo' ? '固定演示样本' : `${recordDay} 全天记录`} · UTC+8
           </span>
         </span>
         <div>
@@ -2158,7 +2124,8 @@ export default function Home() {
     </section>
   );
   return (
-    <div className="shell">
+    <div className={'shell studio-shell terminal-shell view-'+view}>
+      <MarketChartHost/>
       <aside className="sidebar">
         <a
           className="brand"
@@ -2167,21 +2134,24 @@ export default function Home() {
             e.preventDefault();
             setView('overview');
           }}
-          aria-label="PULSE 返回市场总览"
+          aria-label="合约推送 返回市场总览"
         >
           <div className="brand-mark">
-            <Activity />
+            <ChartCandlestick />
           </div>
           <div>
-            PULSE<span>合约异动雷达</span>
+            <strong>合约推送</strong><span>CONTRACT TERMINAL</span>
           </div>
         </a>
         <div className="nav-caption">工作空间</div>
         <nav>
           {[
             ['overview', '市场总览', LayoutDashboard],
-            ['history', '信号记录', History],
-            ['universe', '行情下载与新币', Download],
+            ['history', '指标策略', History],
+            ['smc', '美股 SMC', Layers3],
+
+            ['trading', '实盘交易', Wallet],
+            ['universe', '历史行情与下载', Download],
             ['backtest', '历史回测', BarChart3],
             ['rules', '监测规则', SlidersHorizontal],
             ['system', '系统与推送', Radio],
@@ -2191,11 +2161,11 @@ export default function Home() {
               <Button
                 key={id as string}
                 variant="ghost"
-                className={'nav-item ' + (view === id ? 'selected' : '')}
-                onClick={() => setView(id as string)}
+                className={'nav-item ' + (view === id ? 'selected' : '')} aria-label={label as string} title={label as string}
+                onClick={() => { setDetailOverride(null); setView(id as string); }}
               >
                 <I />
-                {label as string}
+                {id==='universe'?'行情下载':label as string}
                 {id === 'overview' && <span className="nav-live-dot" />}
               </Button>
             );
@@ -2230,7 +2200,7 @@ export default function Home() {
                 </span>
               ))
             ) : (
-              <span>空策略</span>
+              <span>不选指标</span>
             )}
           </div>
           <button onClick={() => setView('rules')}>
@@ -2278,7 +2248,10 @@ export default function Home() {
         <nav className="mobile-nav">
           {[
             ['overview', '总览'],
-            ['history', '记录'],
+            ['history', '指标策略'],
+            ['smc', '美股 SMC'],
+
+            ['trading', '实盘交易'],
             ['universe', '下载与新币'],
             ['backtest', '回测'],
             ['rules', '规则'],
@@ -2286,7 +2259,7 @@ export default function Home() {
           ].map(([v, t]) => (
             <button
               key={v}
-              onClick={() => setView(v)}
+              onClick={() => { setDetailOverride(null); setView(v); }}
               className={view === v ? 'active' : ''}
             >
               {t}
@@ -2294,18 +2267,19 @@ export default function Home() {
           ))}
         </nav>
         <div className="content">
-          <div className="page-heading">
+          <div className={"page-heading" + (["history","quant","backtest","smc"].includes(view) ? " research-heading" : "")}>
             <div>
               <div className="eyebrow">BINANCE USDⓈ-M · USDT CONTRACTS</div>
               <h1>
                 {view === 'backtest'
-                  ? '先检验，再相信'
+                  ? '历史回测工作台'
                   : view === 'universe'
                     ? '下载进度，实时可见'
                     : view === 'overview'
                       ? '捕捉波动，洞察异动'
                       : view === 'history'
-                        ? '每一次异动，都有迹可循'
+                        ? '指标策略，独立筛选'
+                        : view === 'quant' ? '指标策略，先定义规则'
                         : view === 'rules'
                           ? '你的监测规则，清晰可见'
                           : '数据状态，一目了然'}
@@ -2313,13 +2287,14 @@ export default function Home() {
               </h1>
               <p>
                 {view === 'backtest'
-                  ? '真实历史 · 严格成本 · 时间外验证，不用漂亮数字代替证据。'
+                  ? '一天一个 CSV，选出哪些币、何时出现、之后涨跌多少，都列清楚。'
                   : view === 'universe'
                     ? '仅 USDT 计价 · 加密资产与传统金融 · 永续与交割 · 新合约单独提醒。'
                     : view === 'overview'
                       ? '全市场 · 5m / 15m · 连续两根收线，发现值得关注的变化。'
                       : view === 'history'
-                        ? '筛选、关注与导出，保留每个异常信号的完整依据。'
+                        ? '不限制两 K 形态，记录每一次指标触发与条件入选。'
+                        : view === 'quant' ? '策略库、规则草稿、买卖与风险控制的统一入口。'
                         : view === 'rules'
                           ? '四种主要形态全部覆盖，只有完整收盘的 K 线参与判定。'
                           : '如实显示连接、历史预热与存储状态，不将演示数据混入真实行情。'}
@@ -2354,6 +2329,8 @@ export default function Home() {
             <span>
               {mode === 'demo' ? (
                 <BarChart3 size={15} />
+              ) : apiOnline && !blocked && ['warming','degraded'].includes(status.state || '') ? (
+                <RefreshCw size={15} />
               ) : connected ? (
                 <Radio size={15} />
               ) : (
@@ -2374,7 +2351,7 @@ export default function Home() {
                   ? '此地址用于在线验收。实时监测请打开本机看板，并运行采集服务。'
                   : !apiOnline
                     ? '请启动本地监测服务。连接恢复前，已显示的真实信号不会更新。'
-                    : status.message ||
+                    : !blocked && status.state === 'degraded' && status.health_reasons?.length ? status.health_reasons.join('；') : (Number(status.rest_cooldown_seconds)>0 ? `自动请求已暂停，冷却剩余 ${Math.ceil(Number(status.rest_cooldown_seconds))} 秒；本地历史仍可查看。${status.message || ''}` : status.message) ||
                       '等待交易所行情与足够的历史数据；不会使用演示数据补位。'}
             </p>
             {mode === 'demo' ? (
@@ -2411,443 +2388,31 @@ export default function Home() {
               </Button>
             )}
           </div>
-          {(view === 'overview' || view === 'history') && (
-            <>
-              <div className="summary-strip">
-                <div>
-                  <span>
-                    <Radar size={13} />
-                    {mode === 'demo' ? '演示交易对' : '已发现合约'}
-                  </span>
-                  <b>
-                    {mode === 'demo'
-                      ? new Set(demo.map((s) => s.symbol)).size
-                      : (status.universe_count ?? 0)}
-                    <small>
-                      {' '}
-                      {mode === 'demo' ? '个合成样本' : '个 U 本位合约'}
-                    </small>
-                  </b>
-                </div>
-                <div>
-                  <span>
-                    <Activity size={13} />
-                    {mode === 'demo' ? '演示异常信号' : '已加载异常信号'}
-                  </span>
-                  <b>
-                    {source.length}
-                    <small> 条 · 四种形态</small>
-                  </b>
-                </div>
-                <div>
-                  <span>
-                    <ShieldCheck size={13} />
-                    {mode === 'demo' ? '强活跃样本' : '通过全部筛选'}
-                  </span>
-                  <b className="mint">
-                    {
-                      source.filter((s) =>
-                        mode === 'demo'
-                          ? s.activity_score >= 80
-                          : s.qualified === true &&
-                            s.quality_schema_version === 2,
-                      ).length
-                    }
-                    <small>
-                      {' '}
-                      {mode === 'demo' ? '活跃度 ≥80' : '条 · 待人工复核'}
-                    </small>
-                  </b>
-                </div>
-                <div>
-                  <span>
-                    <SlidersHorizontal size={13} />
-                    异常触发门槛
-                  </span>
-                  <b>
-                    {mode === 'live' &&
-                    settings.threshold_profile === 'timeframe'
-                      ? '按周期'
-                      : number(
-                          mode === 'demo' ? 1.5 : settings.volatility_ratio_min,
-                        )}
-                    <small>
-                      {' '}
-                      {mode === 'live' &&
-                      settings.threshold_profile === 'timeframe'
-                        ? '待回测验证'
-                        : '× 历史基准'}
-                    </small>
-                  </b>
-                </div>
-              </div>
-              {view === 'overview' && (
-                <>
-                  <div className="section-title">
-                    <h2>四种形态，一览全局</h2>
-                    <span>
-                      点击形态卡片，筛选对应异常 <ArrowUpRight size={12} />
-                    </span>
-                  </div>
-                  <div className="pattern-grid">
-                    {PATTERNS.map((p, i) => (
-                      <button
-                        key={p}
-                        aria-pressed={pattern === p}
-                        className={
-                          'pattern-card tone-' +
-                          i +
-                          (pattern === p ? ' pattern-selected' : '')
-                        }
-                        onClick={() => setPattern(pattern === p ? 'all' : p)}
-                      >
-                        <div className="pattern-top">
-                          <PatternIcon pattern={p} />
-                          <span className="pattern-count">
-                            {patternCounts[i]}{' '}
-                            <small>条{mode === 'demo' ? '样本' : '信号'}</small>
-                          </span>
-                        </div>
-                        <h3>
-                          {p}
-                          <span>{DESCRIPTIONS[i]}</span>
-                        </h3>
-                        <p>
-                          {p[0]}线 <span>→</span> {p[1]}线
-                        </p>
-                        <div className="pattern-bottom">
-                          <span>
-                            {pattern === p ? '正在筛选此形态' : '查看形态信号'}
-                          </span>
-                          {pattern === p ? (
-                            <Check size={16} />
-                          ) : (
-                            <ArrowUpRight size={16} />
-                          )}
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                  {selected && (
-                    <div className="detail-grid">
-                      <section className="panel chart-panel">
-                        <div className="panel-heading chart-heading">
-                          <div className="selected-symbol">
-                            <Coin symbol={selected.symbol} />
-                            <div>
-                              <h2>
-                                {selected.symbol.includes('_')
-                                  ? selected.symbol
-                                  : asset(selected)}
-                                <span> / {quote(selected)}</span>
-                                <span className="tf-pill">
-                                  {selected.timeframe}
-                                </span>
-                              </h2>
-                              <small>
-                                {mode === 'demo' ? '合成样本' : '信号收线快照'}{' '}
-                                · {categoryLabel(selected)} ·{' '}
-                                {contractLabel(selected)} ·{' '}
-                                {stamp(selected.close_time, true)} UTC+8
-                                {selected.daily_signal_count != null && (
-                                  <span title="北京时间当日该合约全部原始异常次数，不随当前筛选变化">
-                                    {' '}· 当日共 {selected.daily_signal_count} 次
-                                  </span>
-                                )}
-                              </small>
-                            </div>
-                          </div>
-                          <div className="chart-price">
-                            <b>{priceText(selected.price)}</b>
-                            <span
-                              className={
-                                selected.change_pct >= 0 ? 'up' : 'down'
-                              }
-                            >
-                              {signed(selected.change_pct)}
-                            </span>
-                          </div>
-                          <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            onClick={() => setExpanded(true)}
-                            aria-label="放大 K 线图"
-                          >
-                            <Maximize2 />
-                          </Button>
-                        </div>
-                        <div className="chart-meta">
-                          <span>
-                            <i className="small-dot" />
-                            已收盘 K 线
-                          </span>
-                          <span>
-                            两根真实波动 <b>{number(selected.v2_pct)}%</b>
-                          </span>
-                          <span>
-                            历史基准 <b>{number(selected.baseline_v2_pct)}%</b>
-                          </span>
-                          <span className="signal-chart-tag">
-                            {selected.level} {number(selected.volatility_ratio)}
-                            ×
-                          </span>
-                        </div>
-                        {selected.candles?.length ? (
-                          <>
-                            <CandleChart
-                              signal={selected}
-                              layers={chartLayers}
-                              onToggleLayer={toggleChartLayer}
-                            />
-                          </>
-                        ) : (
-                          <div className="empty-state chart-loading">
-                            <Activity size={24} />
-                            <p>{detailFailure || '正在按需读取 K 线详情…'}</p>
-                            {detailFailure && (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setDetailRetry((v) => v + 1)}
-                              >
-                                重试详情
-                              </Button>
-                            )}
-                          </div>
-                        )}
-                        <div className="chart-caption">
-                          <span>
-                            <span
-                              className={
-                                'pattern-tag tone-' +
-                                patternIndex(selected.pattern)
-                              }
-                            >
-                              {selected.pattern}
-                            </span>{' '}
-                            {selected.pattern === '阴阳' ||
-                            selected.pattern === '阳阴'
-                              ? '方向切换 · 关注多空分歧'
-                              : '连续同向 · 关注波动扩张'}
-                          </span>
-                          <a
-                            href="https://www.tradingview.com/"
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            TradingView 轻量图表组件 <ExternalLink size={10} />
-                          </a>
-                        </div>
-                      </section>
-                      <section className="panel score-panel">
-                        <div className="panel-heading">
-                          <h2>活跃度解析</h2>
-                          <button
-                            aria-label="查看评分规则"
-                            className="icon-button"
-                            onClick={() => setHelp(true)}
-                          >
-                            <CircleHelp size={14} />
-                          </button>
-                        </div>
-                        <div className="score-overview">
-                          <div
-                            className="score-ring"
-                            style={
-                              {
-                                '--score':
-                                  Math.min(
-                                    360,
-                                    (selected.activity_score /
-                                      availableActivityMax(selected)) *
-                                      360,
-                                  ) + 'deg',
-                              } as React.CSSProperties
-                            }
-                          >
-                            <div>
-                              <b>{selected.activity_score}</b>
-                              <small>/ {availableActivityMax(selected)}</small>
-                            </div>
-                          </div>
-                          <div>
-                            <span className="chip mint-chip">
-                              {selected.activity_level ||
-                                (selected.activity_score >= 80
-                                  ? '强活跃'
-                                  : '活跃级')}
-                            </span>
-                            <p>
-                              {missingActivityInputs(selected).length
-                                ? `可用信息满分 ${availableActivityMax(selected)}；缺少${missingActivityInputs(selected).join('、')}，缺失项计 0 分`
-                                : '五项信息完整，满分 100'}
-                            </p>
-                            <small>
-                              波动倍数 {number(selected.volatility_ratio)}×
-                            </small>
-                          </div>
-                        </div>
-                        <div className="score-bars">
-                          {SCORE_LABELS.map(([key, label, max]) => (
-                            <div key={key}>
-                              <div>
-                                <span>
-                                  {label}
-                                  {key === 'oi' &&
-                                    missingActivityInputs(selected).includes(
-                                      '持仓变化',
-                                    ) && (
-                                      <em>待积累</em>
-                                    )}
-                                  {key === 'liquidity' &&
-                                    (missingActivityInputs(selected).includes(
-                                      '流动性排名',
-                                    ) ||
-                                      missingActivityInputs(selected).includes(
-                                        '买卖价差',
-                                      )) && <em>部分缺失</em>}
-                                </span>
-                                <b>
-                                  {selected.score_breakdown[key] ?? 0}
-                                  <small> / {max}</small>
-                                </b>
-                              </div>
-                              <div className="score-bar">
-                                <i
-                                  style={{
-                                    width:
-                                      ((selected.score_breakdown[key] ?? 0) /
-                                        max) *
-                                        100 +
-                                      '%',
-                                    background:
-                                      key === 'oi'
-                                        ? '#8c9eec'
-                                        : key === 'flow'
-                                          ? '#66b8d5'
-                                          : '#55cbb3',
-                                  }}
-                                />
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                        <div className="score-disclaimer">
-                          <ShieldCheck size={12} />
-                          分数衡量市场活跃度，不代表胜率
-                        </div>
-                      </section>
-                    </div>
-                  )}
-                </>
-              )}
-              {signalTable}
-              {view === 'overview' && selected && (
-                <ConfirmationPanel
-                  signal={selected}
-                  synthetic={mode === 'demo'}
-                />
-              )}
-              {view === 'overview' && selected && (
-                <section className="panel evidence-panel">
-                  <div className="panel-heading">
-                    <h2>
-                      触发依据{' '}
-                      <span className="muted">
-                        {selected.symbol} · {selected.timeframe}
-                      </span>
-                    </h2>
-                    <a
-                      target="_blank"
-                      rel="noreferrer"
-                      className="external-link"
-                      href={
-                        'https://www.binance.com/en/futures/' + selected.symbol
+          {<MarketDashboard active={view === 'overview'} api={api} online={apiOnline} records={recordStrategy==='smc'?<SmcWorkspace active={view==='overview'} api={api} onWaveTrend={()=>chooseRecordStrategy('wt')}/>:signalTable} onResearch={() => setView('history')} onQuant={()=>setView('history')} />}
+          {view === 'rules' && <WorkspaceTabs labels={['异常检测','指标与门槛','历史基准说明']} footer={<div className="form-actions">
+                    <Button
+                      variant="outline"
+                      onClick={() => setDraft(DEFAULT_SETTINGS)}
+                    >
+                      恢复默认草稿
+                    </Button>
+                    <Button
+                      onClick={saveSettings}
+                      disabled={
+                        !apiOnline ||
+                        saving ||
+                        !Number.isFinite(draft.volatility_ratio_min) ||
+                        draft.volatility_ratio_min < 1.5 ||
+                        draft.volatility_ratio_min > 20 ||
+                        !Number.isFinite(draft.trim_percent) ||
+                        draft.trim_percent < 0 ||
+                        draft.trim_percent > 10
                       }
                     >
-                      币安合约 <ExternalLink size={12} />
-                    </a>
-                  </div>
-                  <div className="evidence-grid">
-                    <div>
-                      <span>两根累计成交额</span>
-                      <b>
-                        {compact(selected.quote_volume)}{' '}
-                        <small>{quote(selected)}</small>
-                      </b>
-                    </div>
-                    <div>
-                      <span>主动买入 / 卖出</span>
-                      <b>
-                        {selected.taker_buy_ratio == null
-                          ? '—'
-                          : number(selected.taker_buy_ratio * 100, 1) +
-                            '% / ' +
-                            number((1 - selected.taker_buy_ratio) * 100, 1) +
-                            '%'}
-                      </b>
-                    </div>
-                    <div>
-                      <span>持仓量变化</span>
-                      <b
-                        className={
-                          (selected.oi_change_pct ?? 0) >= 0 ? 'up' : 'down'
-                        }
-                      >
-                        {signed(selected.oi_change_pct)}
-                      </b>
-                    </div>
-                    <div>
-                      <span>买卖价差</span>
-                      <b>
-                        {number(selected.spread_bps, 1)} <small>bps</small>
-                      </b>
-                    </div>
-                    <div>
-                      <span>
-                        {selected.liquidity_rank_scope === 'same_quote_asset'
-                          ? '同报价合约成交额分位'
-                          : '24h 成交额分位（历史口径）'}
-                      </span>
-                      <b>
-                        {selected.liquidity_percentile == null
-                          ? '—'
-                          : '前 ' +
-                            number(
-                              (1 - selected.liquidity_percentile) * 100,
-                              1,
-                            ) +
-                            '%'}
-                      </b>
-                    </div>
-                    <div>
-                      <span>历史有效窗口</span>
-                      <b>
-                        {selected.baseline_samples.toLocaleString()}{' '}
-                        <small>组</small>
-                      </b>
-                    </div>
-                  </div>
-                  <div className="signal-warnings">
-                    <span>
-                      <Activity size={12} />
-                      {selected.oi_structure}
-                    </span>
-                    {selected.warnings.map((w, i) => (
-                      <span key={i}>
-                        <AlertTriangle size={12} />
-                        {displayWarning(selected, w)}
-                      </span>
-                    ))}
-                    <span>代币地址：暂无可靠映射</span>
-                  </div>
-                </section>
-              )}
-            </>
-          )}
-          {view === 'rules' && (
-            <div className="rules-layout">
-              <section className="panel rules-form">
+                      {saving ? <RefreshCw className="spin" /> : <Check />}
+                      保存监测规则
+                    </Button>
+                  </div>}><section className="panel rules-form">
                 <div className="panel-heading">
                   <h2>
                     <SlidersHorizontal size={17} />
@@ -2883,10 +2448,11 @@ export default function Home() {
                     <span>监测形态</span>
                     <FilterSelect
                       label="监测模式"
-                      value={draft.pattern_mode}
-                      onChange={(v) => setDraft({ ...draft, pattern_mode: v })}
+                      value={draft.pattern_mode==='all'&&draft.allow_doji?'none':draft.pattern_mode}
+                      onChange={(v) => setDraft({ ...draft, pattern_mode: v==='none'?'all':v,allow_doji:v==='none' })}
                       items={[
                         ['all', '全部四种主要形态'],
+                        ['none', '无形态限制（含十字星，仍保留异常门槛）'],
                         ['mixed_only', '仅方向切换：阳阴、阴阳'],
                       ]}
                     />
@@ -2940,6 +2506,7 @@ export default function Home() {
                       aria-label="包含十字星"
                     />
                   </div>
+                  <PersonalRuleSettings api={api}/>
                   <div className="rule-fixed">
                     <ShieldCheck size={17} />
                     <div>
@@ -2955,42 +2522,18 @@ export default function Home() {
                       此预览未连接本地服务，暂不能保存监测规则。实时设置需在本机看板中修改。
                     </p>
                   )}
-                  <div className="form-actions">
-                    <Button
-                      variant="outline"
-                      onClick={() => setDraft(DEFAULT_SETTINGS)}
-                    >
-                      恢复默认草稿
-                    </Button>
-                    <Button
-                      onClick={saveSettings}
-                      disabled={
-                        !apiOnline ||
-                        saving ||
-                        !Number.isFinite(draft.volatility_ratio_min) ||
-                        draft.volatility_ratio_min < 1.5 ||
-                        draft.volatility_ratio_min > 20 ||
-                        !Number.isFinite(draft.trim_percent) ||
-                        draft.trim_percent < 0 ||
-                        draft.trim_percent > 10
-                      }
-                    >
-                      {saving ? <RefreshCw className="spin" /> : <Check />}
-                      保存监测规则
-                    </Button>
-                  </div>
+
                   <p className="field-help">
                     演示页使用固定验收样本，修改真实规则不会重算演示或历史记录。
                   </p>
                 </div>
               </section>
-              <div className="rules-right">
-                <IndicatorSettingsPanel
+              <div className="rule-indicator-pane"><IndicatorSettingsPanel
                   value={draft}
                   onChange={(v) => setDraft({ ...draft, ...v })}
                   api={api}
                   online={apiOnline}
-                />
+                /></div><div className="rule-reference">
                 <section className="panel">
                   <div className="panel-heading">
                     <h2>5m / 15m 历史基准</h2>
@@ -3030,12 +2573,8 @@ export default function Home() {
                     即使一涨一跌后价格回到原位，也能捕捉途中发生的大幅波动。
                   </p>
                 </section>
-              </div>
-            </div>
-          )}
-          {view === 'system' && (
-            <>
-              <div className="system-grid">
+</div></WorkspaceTabs>}
+          {view === 'system' && <WorkspaceTabs labels={['运行状态','推送设置','说明与更新']}><div className="system-terminal-status"><div className="system-grid">
                 {[
                   [
                     Radio,
@@ -3069,7 +2608,7 @@ export default function Home() {
                   [
                     Send,
                     'Telegram',
-                    '在下方配置',
+                    '独立配置',
                     'Token 只写不回显 · 一次性链接安全绑定',
                   ],
                 ].map(([Icon, title, value, desc]) => {
@@ -3087,8 +2626,7 @@ export default function Home() {
                   );
                 })}
               </div>
-              <TelegramSettingsPanel api={api} online={apiOnline} />
-              <section className="panel status-details">
+               <section className="panel status-details">
                 <div className="panel-heading">
                   <h2>运行健康状况</h2>
                   <Button
@@ -3159,11 +2697,11 @@ export default function Home() {
                   </div>
                   <div>
                     <dt>自动交易</dt>
-                    <dd>未接入；Telegram 推送在上方单独设置</dd>
+                    <dd>未接入；Telegram 推送在“推送设置”中配置</dd>
                   </div>
                 </dl>
-              </section>
-              <div className="system-note">
+{status.live_rules && <section className="system-note"><h3>WT / 个人规则运行状态</h3><p>等待处理 {status.live_rules.queue_depth} 项 · {status.live_rules.active?'正在计算':'当前空闲'} · 本次启动已处理 {status.live_rules.processed} 项</p><p>已跳过 {status.live_rules.dropped} 项（超时 {status.live_rules.drop_reasons.expired || 0}、队列满 {status.live_rules.drop_reasons.queue_full || 0}、数据不完整 {status.live_rules.drop_reasons.incomplete_history || 0}）· 错误 {status.live_rules.errors} 次</p><p>最近一项耗时 {status.live_rules.last_duration_ms ?? '—'} 毫秒。统计对象是处理任务，不是漏掉的信号数。</p>{status.live_rules.last_error && <p>最近错误：{status.live_rules.last_error}</p>}</section>}
+              </section></div><TelegramSettingsPanel api={api} online={apiOnline} /><div className="system-terminal-help"><div className="system-note">
                 <AlertTriangle size={18} />
                 <p>
                   首次安装无需手动下载：程序会自动发现全部 USDT 合约并加载 5m / 15m
@@ -3172,16 +2710,14 @@ export default function Home() {
                   分。网络受限时保留可见的错误状态，不使用演示数据冒充实时结果。
                 </p>
               </div>
-            </>
-          )}
-          {view === 'universe' && (
-            <>
-              <DownloadPanel api={api} online={apiOnline} />
-              <UniversePanel api={api} online={apiOnline} />
-            </>
-          )}
+<UpdateControl api={api} online={apiOnline}/></div></WorkspaceTabs>}
+          {view === 'universe' && <DataWorkspace api={api} online={apiOnline} />}
+          {<SmcWorkspace active={view === 'smc'} standalone api={api}/>}
+          {(view === 'history' || view === 'quant') && <ResearchWorkbench key="signals" api={api} online={apiOnline} signals />}
+
+          {view === 'trading' && <LiveTradingWorkspace/>}
           {view === 'backtest' && (
-            <BacktestPanel api={api} online={apiOnline} />
+            <ResearchWorkbench key="backtest" api={api} online={apiOnline} />
           )}
           <footer>
             <span>
@@ -3189,7 +2725,7 @@ export default function Home() {
               仅监测 · 不自动开仓 · 异常信号不构成交易建议
             </span>
             <span>
-              PULSE v1.0.2 <i />
+              合约推送 <i />
               {mode === 'demo' ? '演示数据已标识' : '只接收完整收盘 K 线'}
             </span>
           </footer>
@@ -3197,7 +2733,7 @@ export default function Home() {
       </main>
       <Dialog open={help} onOpenChange={setHelp}>
         <DialogContent className="help-dialog">
-          <DialogTitle>PULSE · 规则与数据说明</DialogTitle>
+          <DialogTitle>合约推送 · 规则与数据说明</DialogTitle>
           <DialogDescription>
             让每个信号的来源、计算方式与限制都可追溯。
           </DialogDescription>
@@ -3257,6 +2793,7 @@ export default function Home() {
           </div>
         </DialogContent>
       </Dialog>
+      <SymbolDayHistory api={api} target={symbolHistory} onClose={() => setSymbolHistory(null)} />
       <Dialog open={expanded} onOpenChange={setExpanded}>
         <DialogContent className="expanded-dialog">
           <DialogTitle>

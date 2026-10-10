@@ -300,7 +300,8 @@ class Research:
                 sources.append(data['metadata'])
             return self.register(candles,{'type':'binance_official_archive','sources':sources,'verified_checksum':True})
         candles,meta = self.load(payload['dataset_id'])
-        settings = Settings(**snapshot)
+        from .policy import migrate_saved_settings
+        settings = Settings(**migrate_saved_settings(snapshot))
         result = run_backtest(candles,settings.engine(),settings.indicator_config(),settings.quality.model_dump(),
             {'max_holding_bars':payload['max_holding_bars'],'compare_thresholds':True,
              'threshold_profile':settings.threshold_profile,'fee_bps_per_side':settings.quality.fee_bps_per_side,

@@ -1,5 +1,6 @@
 """Contract and numerical tests for the standalone detection engine."""
 
+from monitor.periods import ceil_bar, shift
 from dataclasses import replace
 import math
 import unittest
@@ -13,16 +14,16 @@ from monitor.engine import (
 
 def fixture(pattern="阳阳", ratio=1.5, timeframe="1d", history_count=None):
     """Baseline NTR is .02 per bar; current pair has exactly requested ratio."""
-    interval = TIMEFRAME_MS[timeframe]
+    start = ceil_bar(0, timeframe)
     count = LOOKBACK[timeframe]["minimum_bars"] + 1 if history_count is None else history_count
     candles = [
-        Candle("TESTUSDT", timeframe, i * interval, (i + 1) * interval - 1,
+        Candle("TESTUSDT", timeframe, shift(start, timeframe, i), shift(start, timeframe, i + 1) - 1,
                99.8, 101, 99, 100, 1000, 550, 20, 10)
         for i in range(count)
     ]
     for char in pattern:
         i = len(candles)
-        candles.append(Candle("TESTUSDT", timeframe, i * interval, (i + 1) * interval - 1,
+        candles.append(Candle("TESTUSDT", timeframe, shift(start, timeframe, i), shift(start, timeframe, i + 1) - 1,
                               99.6 if char == "阳" else 100.4, 100 + ratio, 100 - ratio, 100,
                               3000, 2100, 30, 30))
     return candles
@@ -290,8 +291,13 @@ class AggregationTests(unittest.TestCase):
 
     def test_every_timeframe_complete_utc_bucket(self):
         for timeframe, interval in TIMEFRAME_MS.items():
+            if timeframe == "1s":
+                with self.assertRaises(ValueError):
+                    aggregate_minutes(self.minutes(1), timeframe)
+                continue
+            start = ceil_bar(1706745600000, timeframe)  # February 2024, including leap day.
+            interval = shift(start, timeframe) - start
             count = interval // 60_000
-            start = interval * 20_000
             minutes = self.minutes(count, start)
             result = aggregate_minutes(minutes, timeframe)
             with self.subTest(timeframe=timeframe):

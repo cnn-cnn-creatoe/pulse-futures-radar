@@ -12,7 +12,7 @@ $script:MinimumPython = [version]'3.11.0'
 $script:MinimumNode = [version]'22.13.0'
 
 function Write-Step([string]$Message) {
-    Write-Host ('[PULSE] {0}' -f $Message) -ForegroundColor Cyan
+    Write-Host ('[合约推送] {0}' -f $Message) -ForegroundColor Cyan
 }
 
 function Refresh-ProcessPath {
@@ -289,7 +289,7 @@ try {
     exit 0
 }
 catch {
-    Write-Host ('[PULSE] 启动失败：{0}' -f $_.Exception.Message) -ForegroundColor Red
+    Write-Host ('[合约推送] 启动失败：{0}' -f $_.Exception.Message) -ForegroundColor Red
     Write-Host ('日志位置：{0}' -f $script:RuntimeRoot) -ForegroundColor Yellow
     exit 1
 }

@@ -273,6 +273,8 @@ class MetadataTests(unittest.TestCase):
     def test_retry_after_seconds_respects_server_delay(self):
         self.assertEqual(retry_after_seconds("123"), 123)
         self.assertEqual(retry_after_seconds(None), 60)
+        for bad in ("nan","inf","-1"):
+            self.assertEqual(retry_after_seconds(bad,120),120)
 
 
 class CollectorTests(unittest.IsolatedAsyncioTestCase):
@@ -325,7 +327,7 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(original_map), {row["symbol"] for row in symbols})
         self.assertTrue(all(not task.cancelled() for task in original_tasks))
 
-    async def test_scope_change_recycles_both_shard_families_and_stop_closes_all(self):
+    async def test_scope_change_recycles_used_streams_without_idle_mark_price_subscriptions(self):
         self.service._running = True
         symbols = [meta(f"TEST{i:03d}USDT") for i in range(560)] + [meta("中文USDT")]
         active = {}
@@ -360,12 +362,12 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         await self.service._refresh_universe()
         await asyncio.sleep(0)
         originals = list(self.service._shards)
-        self.assertEqual(len(originals), 32)
-        self.assertEqual(len(active), 32)
+        self.assertEqual(len(originals), 17)
+        self.assertEqual(len(active), 17)
         for index in range(15):
-            self.assertEqual(active[f"kline-{index}"], active[f"market-{index}"])
-            self.assertLessEqual(len(active[f"market-{index}"]), 40)
-        all_market = [symbol for name, group in active.items() if name.startswith("market-") for symbol in group]
+            self.assertLessEqual(len(active[f"kline-{index}"]), 40)
+            self.assertNotIn(f"market-{index}", active)
+        all_market = [symbol for name, group in active.items() if name.startswith("kline-") for symbol in group]
         self.assertEqual(sorted(all_market), sorted(row["symbol"] for row in symbols))
         symbols = [*symbols[1:], meta("NEWUSDT")]
         self.service._ticker["TEST000USDT"] = {"quote_volume": 1, "price": 1, "time": self.now_ms}
@@ -373,15 +375,15 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         await self.service._refresh_universe()
         await asyncio.sleep(0)
         self.assertTrue(all(task.cancelled() for task in originals))
-        self.assertEqual(len(cancelled), 32)
-        self.assertEqual(len(active), 32)
+        self.assertEqual(len(cancelled), 17)
+        self.assertEqual(len(active), 17)
         self.assertNotIn("TEST000USDT", self.service._symbol_shard)
         self.assertNotIn("TEST000USDT", self.service._ticker)
         self.assertNotIn("TEST000USDT", self.service._mark)
         self.assertIn("NEWUSDT", self.service._symbol_shard)
         await self.service.stop()
         self.assertEqual(active, {})
-        self.assertEqual(len(cancelled), 64)
+        self.assertEqual(len(cancelled), 34)
         self.assertFalse(self.service._shards)
         self.assertFalse(self.service._tasks)
 
@@ -669,8 +671,15 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             "last_event_time": self.now_ms,
         }
         self.assertFalse(self.service.status()["metadata_stale"])
+        self.service._running = True
+        self.service._state = "ready"
+        self.service._symbol_shard["1000PEPEUSDT"] = "kline-0"
+        self.service._connections["kline-0"] = {"state": "connected"}
+        self.service._symbol_heartbeat["1000PEPEUSDT"] = self.now_ms
+        self.assertTrue(self.service._symbol_live("1000PEPEUSDT"))
         self.service._connections["market-control"]["last_event_time"] = self.now_ms - 90_001
         self.assertTrue(self.service.status()["metadata_stale"])
+        self.assertFalse(self.service._symbol_live("1000PEPEUSDT"))
 
     def test_connection_latency_is_bounded_and_transport_cannot_hide_stale_content(self):
         self.service._state = "warming"
@@ -686,10 +695,59 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.service._record_connection_event("kline-0", self.now_ms - 90_001, self.now_ms)
         status = self.service.status()
         self.assertEqual(status["connections"][0]["last_message"], self.now_ms)
-        self.assertFalse(status["connections"][0]["content_fresh"])
-        self.assertEqual(status["state"], "reconnecting")
-        self.service._record_connection_event("kline-0", self.now_ms + 60_000, self.now_ms)
+        # An out-of-order packet cannot erase a fresh high-watermark.
+        self.assertTrue(status["connections"][0]["content_fresh"])
+        self.service._record_connection_event("kline-0", self.now_ms + 160_000, self.now_ms)
+        self.assertEqual(self.service._connections["kline-0"]["last_event_time"], self.now_ms)
+        self.service.now = lambda: self.now_ms + 90_001
+        self.service._record_connection_event("kline-0", self.now_ms, self.now_ms + 90_001)
         self.assertFalse(self.service.status()["connections"][0]["content_fresh"])
+        self.assertEqual(self.service.status()["state"], "reconnecting")
+
+    async def test_transport_packets_cannot_keep_stale_connection_open(self):
+        ws = SimpleNamespace(receive=AsyncMock())
+        self.service._connections["kline-0"] = {
+            "last_event_time": self.now_ms-90_001, "last_message": self.now_ms}
+        with self.assertRaises(TimeoutError):
+            await self.service._receive_stream(ws,"kline-0")
+        ws.receive.assert_not_awaited()
+
+    async def test_gap_repair_fetches_only_missing_formal_buckets(self):
+        interval = TIMEFRAME_MS["5m"]
+        self.store.save_candles([bar(0,timeframe="5m"),bar(2*interval,timeframe="5m")])
+        self.service._fetch_range = AsyncMock()
+        await self.service._fetch_missing_formal_range("1000PEPEUSDT","5m",0,3*interval-1)
+        self.service._fetch_range.assert_awaited_once_with("1000PEPEUSDT","5m",interval,2*interval-1)
+        self.service._fetch_range.reset_mock()
+        await self.service._fetch_missing_formal_range("1000PEPEUSDT","5m",0,interval-1)
+        self.service._fetch_range.assert_not_awaited()
+
+    def test_old_packet_does_not_reconnect_but_sustained_staleness_does(self):
+        old = self.now_ms - 100_000
+        with patch("monitor.collector.time.monotonic", return_value=10):
+            self.assertFalse(self.service._accept_stream_event("kline-0", old, self.now_ms))
+        with patch("monitor.collector.time.monotonic", return_value=39):
+            self.assertFalse(self.service._accept_stream_event("kline-0", old, self.now_ms))
+        self.assertTrue(self.service._accept_stream_event("kline-0", self.now_ms, self.now_ms))
+        self.assertNotIn("invalid_since", self.service._connections["kline-0"])
+        with patch("monitor.collector.time.monotonic", return_value=50):
+            self.assertFalse(self.service._accept_stream_event("kline-0", old, self.now_ms))
+        with patch("monitor.collector.time.monotonic", return_value=81):
+            with self.assertRaises(TimeoutError):
+                self.service._accept_stream_event("kline-0", old, self.now_ms)
+
+    def test_access_cooldown_survives_restart_and_ws_shares_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cooldown.json"
+            budget = WeightBudget(cooldown_path=path)
+            budget.defer(120)
+            restored = WeightBudget(cooldown_path=path)
+            self.assertGreater(restored.cooldown_until - time.monotonic(), 118)
+            self.service._budget = restored
+            self.service._ws_failure(SimpleNamespace(status=418, headers={}))
+            self.assertGreater(restored.cooldown_until - time.monotonic(), 259198)
+            restored_again = WeightBudget(cooldown_path=path)
+            self.assertGreater(restored_again.cooldown_until - time.monotonic(), 259198)
 
     async def test_parallel_gap_recovery_is_independent_and_deduplicates_symbols(self):
         self.service._running = True
@@ -877,6 +935,21 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service._budget.used_headers, {
             "X-MBX-USED-WEIGHT-1M": 1888, "X-MBX-USED-WEIGHT-10S": 77})
         self.assertEqual(self.service._rest_usage_history[-1]["status"], 429)
+
+    async def test_rate_limit_body_also_stops_requests(self):
+        class Response:
+            status=200
+            headers={}
+            async def __aenter__(inner): return inner
+            async def __aexit__(inner,*args): return False
+            def raise_for_status(inner): pass
+            async def json(inner): return {'code':-1003,'msg':'Too many requests'}
+        get=__import__('unittest.mock',fromlist=['Mock']).Mock(return_value=Response())
+        self.service._session=SimpleNamespace(get=get,close=AsyncMock())
+        with self.assertRaises(BinanceRateLimitError):
+            await self.service._request('/fapi/v1/time')
+        self.assertEqual(get.call_count,1)
+        self.assertGreater(self.service._budget.cooldown_until,time.monotonic()+59)
 
     def test_steady_state_open_interest_rest_poller_is_removed(self):
         self.assertFalse(hasattr(self.service, "_oi_poller"))
@@ -1211,6 +1284,13 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.service._request = sampled_clock
         with patch("monitor.collector.time.time", return_value=1000), \
              patch("monitor.collector.time.monotonic", side_effect=[10.0, 12.0]):
+            await self.service._sync_clock()
+        self.assertEqual(self.service._clock_offset, 200)
+        self.assertEqual(self.service._clock_rtt_ms, 500)
+        self.service._clock_sample = {}
+        self.service._request = fake_clock
+        with patch("monitor.collector.time.time", return_value=1001), \
+             patch("monitor.collector.time.monotonic", side_effect=[20.0, 28.0]):
             await self.service._sync_clock()
         self.assertEqual(self.service._clock_offset, 200)
         self.assertEqual(self.service._clock_rtt_ms, 500)
@@ -2232,6 +2312,11 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
 
         self.service._spread = fake_spread
         self.service.candidate_transform = old_policy
+        self.service._state = "ready"
+        self.service._last_refresh = self.now_ms
+        self.service._symbol_shard["1000PEPEUSDT"] = "kline-0"
+        self.service._connections["kline-0"] = {"state": "connected"}
+        self.service._symbol_heartbeat["1000PEPEUSDT"] = self.now_ms
         with patch("monitor.collector.analyze", side_effect=deterministic_analyze):
             await self.service._on_closed(final_minute)
             self.assertEqual(self.service._analysis_queue.qsize(), 1)
@@ -2287,6 +2372,43 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rows[0]["quality_schema_version"], 2)
             self.assertEqual(rows[0]["rejection_reasons"], ["delayed_candidate"])
             self.assertTrue(rows[0]["quality_reasons"])
+            self.assertTrue(rows[0]["warnings"])
+            self.assertEqual(self.store.list_alerts(qualified=True, schema_version=2), [])
+            self.assertEqual(len(self.store.list_alerts(qualified=False, schema_version=2)), 1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_gap_discovered_during_indicator_revokes_qualification_but_keeps_history(self):
+        count = LOOKBACK["1m"]["minimum_bars"] + 3
+        end = self.now_ms // MINUTE * MINUTE
+        candles = [bar(end - (count - i) * MINUTE) for i in range(count)]
+        candles[-2] = bar(candles[-2].open_time, high=110, close=109)
+        candles[-1] = bar(candles[-1].open_time, open=109, high=120, low=108, close=119)
+        self.store.save_candles(candles)
+        close = candles[-1].close_time
+        self.service._watermark = close - MINUTE
+        self.service._running = True
+
+        async def fake_spread(symbol):
+            return 1
+
+        async def slow_policy(signal, candles, enrichment):
+            self.assertFalse(signal["delayed"])
+            self.service._gap_pending.add("1000PEPEUSDT")
+            return {**signal, "qualified": True, "quality_schema_version": 2, "quality_reasons": []}
+
+        self.service._spread = fake_spread
+        self.service._candidate_queue.put_nowait(("1000PEPEUSDT", "1m", close, {}, slow_policy))
+        task = asyncio.create_task(self.service._candidate_worker())
+        try:
+            await asyncio.wait_for(self.service._candidate_queue.join(), timeout=2)
+            rows = self.store.list_alerts()
+            self.assertEqual(len(rows), 1)
+            self.assertFalse(rows[0]["qualified"])
+            self.assertFalse(rows[0]["delayed"])
+            self.assertEqual(rows[0]["quality_schema_version"], 2)
+            self.assertEqual(rows[0]["rejection_reasons"], ["market_not_ready_at_publish"])
             self.assertTrue(rows[0]["warnings"])
             self.assertEqual(self.store.list_alerts(qualified=True, schema_version=2), [])
             self.assertEqual(len(self.store.list_alerts(qualified=False, schema_version=2)), 1)

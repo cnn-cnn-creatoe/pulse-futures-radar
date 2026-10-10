@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from .actionability import score_projection, refresh_saved
 import sqlite3
 import threading
 import time
@@ -10,6 +11,8 @@ from typing import Iterable
 
 from .engine import Candle
 from .history_data import valid_contract_symbol
+from .retention import (RETENTION_DAYS, DETAIL_SCHEMA, DETAIL_INDEX,
+                        split_alert, restore_alert, candle_cutoff_sql)
 
 
 DAY_MS = 86_400_000
@@ -91,11 +94,15 @@ class Store:
     def __init__(self, path: str | Path):
         self.path = str(path)
         if self.path != ":memory:":
+            if Path(self.path + ".maintenance").exists():
+                raise RuntimeError("数据库正在整理，请等待整理完成后再启动监测。")
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._db = sqlite3.connect(self.path, check_same_thread=False, timeout=15)
         self._db.row_factory = sqlite3.Row
         with self._db:
+            # Effective on new databases; existing ones are rebuilt by the maintenance tool.
+            self._db.execute("PRAGMA auto_vacuum=INCREMENTAL")
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA busy_timeout=15000")
             self._db.executescript("""
@@ -107,6 +114,10 @@ class Store:
                     taker_buy_quote REAL NOT NULL, trades INTEGER NOT NULL,
                     volume REAL NOT NULL, closed INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY(symbol, timeframe, open_time)
+                ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS market_evidence (
+                    symbol TEXT NOT NULL, close_time INTEGER NOT NULL, payload TEXT NOT NULL,
+                    PRIMARY KEY(symbol,close_time)
                 ) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS alerts (
                     event_key TEXT PRIMARY KEY, symbol TEXT NOT NULL,
@@ -120,6 +131,11 @@ class Store:
                     signal_count INTEGER NOT NULL,
                     PRIMARY KEY(symbol,day_start,timeframe,direction)
                 ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS indicator_research_events (
+                    event_key TEXT PRIMARY KEY, symbol TEXT NOT NULL,
+                    day_start INTEGER NOT NULL, payload TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS indicator_research_day ON indicator_research_events(day_start);
                 CREATE TABLE IF NOT EXISTS store_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -149,6 +165,8 @@ class Store:
                 CREATE INDEX IF NOT EXISTS listing_events_observed
                     ON listing_events(observed_at DESC);
             """)
+            self._db.execute(DETAIL_SCHEMA)
+            self._db.execute(DETAIL_INDEX)
             # Reconcile an upgraded database once, and repeat only if a legacy
             # writer changed the alert table without updating the counters.
             # Normal restarts therefore avoid the JSON grouping scan.
@@ -342,14 +360,17 @@ class Store:
         payload.setdefault("created_at", int(time.time() * 1000))
         day_start = shanghai_day_start(close_time)
         direction = alert_direction(payload)
+        encoded, details = split_alert(payload)
         with self._lock, self._db:
             cursor = self._db.execute(
                 "INSERT OR IGNORE INTO alerts VALUES (?,?,?,?,?,?)",
                 (key, alert["symbol"], alert["timeframe"], close_time,
-                 payload["created_at"], json.dumps(payload, ensure_ascii=False, allow_nan=False)),
+                 payload["created_at"], encoded),
             )
             if cursor.rowcount != 1:
                 return False
+            if details is not None:
+                self._db.execute("INSERT INTO alert_details VALUES (?,?,?)", (key, close_time, details))
             self._db.execute("""
                 INSERT INTO alert_daily_counts
                     (symbol,day_start,timeframe,direction,signal_count)
@@ -360,11 +381,13 @@ class Store:
             counts = self._daily_counts_locked(payload["symbol"], day_start,
                                                 payload["timeframe"], direction)
             payload.update(counts)
+            summary = json.loads(encoded)
+            summary.update(counts)
             # The immutable evidence records the count visible when the live
             # event was accepted. API reads recompute it from the counter table
             # so older rows on the same day also show the final current total.
             self._db.execute("UPDATE alerts SET payload=? WHERE event_key=?", (
-                json.dumps(payload, ensure_ascii=False, allow_nan=False), key))
+                json.dumps(summary, ensure_ascii=False, allow_nan=False, separators=(",", ":")), key))
         return True
 
     def daily_counts_for_alert(self, alert: dict) -> dict:
@@ -405,6 +428,7 @@ class Store:
 
     def _enrich_daily_counts(self, alerts: list[dict]) -> list[dict]:
         """Attach final UTC+8 daily counts to list/detail rows in bounded batches."""
+        alerts = [refresh_saved(a) for a in alerts]
         if not alerts:
             return alerts
         identities = []
@@ -455,6 +479,7 @@ class Store:
         # Qualification, reasons, confirmations, trade plan, scores and policy
         # hash stay on the compact row; the immutable payload is never updated.
         projection = "payload" if include_candles else "json_remove(payload, '$.candles', '$.indicators', '$.indicator_context', '$.policy_snapshot')"
+        projection = score_projection(projection)
         conditions = ["COALESCE(json_extract(payload,'$.source'),'live')='live'", "COALESCE(json_extract(payload,'$.synthetic'),0)!=1"]
         params = []
         if qualified is not None:
@@ -482,16 +507,105 @@ class Store:
                 ELSE (symbol GLOB ? OR symbol GLOB ?) END""")
             params.extend([quote_asset, quote_asset, f"?*{quote_asset}",
                            f"?*{quote_asset}_[0-9][0-9][0-9][0-9][0-9][0-9]"])
-        sql = f"SELECT {projection} FROM alerts"
+        sql = f"SELECT {projection},event_key FROM alerts"
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY close_time DESC LIMIT ?"
         params.append(max(1, min(int(limit), 100_000)))
         with self._lock:
             rows = self._db.execute(sql, params).fetchall()
-        return self._enrich_daily_counts([json.loads(row[0]) for row in rows])
+            items = []
+            for row in rows:
+                item = json.loads(row[0])
+                if include_candles:
+                    detail = self._db.execute("SELECT payload FROM alert_details WHERE event_key=?", (row[1],)).fetchone()
+                    item = restore_alert(item, detail[0] if detail else None)
+                items.append(item)
+        return self._enrich_daily_counts(items)
+
+    def chart_alerts(self, symbol: str, timeframe: str, start: int, end: int) -> list[dict]:
+        """Read the chart's own archived candidates, filtered before pagination."""
+        with self._lock:
+            rows = self._db.execute("""SELECT json_remove(payload, '$.candles', '$.indicators',
+                '$.indicator_context', '$.policy_snapshot') FROM alerts
+                WHERE symbol=? AND timeframe=? AND close_time BETWEEN ? AND ?
+                AND COALESCE(json_extract(payload,'$.source'),'live')='live'
+                AND COALESCE(json_extract(payload,'$.synthetic'),0)!=1
+                ORDER BY close_time""", (symbol, timeframe, start, end)).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     is_trade_qualified = staticmethod(is_trade_qualified)
+
+    def alert_days(self) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute("""SELECT day_start,SUM(signal_count) AS records,
+                COUNT(DISTINCT symbol) AS symbols FROM alert_daily_counts
+                GROUP BY day_start ORDER BY day_start DESC""").fetchall()
+        return [{"date": self._daily_count_fields(row["day_start"], 0, 0, 0)["daily_signal_date"],
+                 "records": row["records"], "symbols": row["symbols"]} for row in rows]
+
+    def save_indicator_events(self, rows: list[dict]) -> None:
+        """A separate ledger: research never creates live alerts or Telegram events."""
+        with self._lock, self._db:
+            self._db.executemany("INSERT OR IGNORE INTO indicator_research_events VALUES (?,?,?,?)",
+                [(r["id"],r["symbol"],shanghai_day_start(r["close_time"]),json.dumps(r,ensure_ascii=False)) for r in rows])
+
+    def indicator_days(self) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute("SELECT day_start,COUNT(*) AS records FROM indicator_research_events GROUP BY day_start").fetchall()
+        return [{"date":self._daily_count_fields(r["day_start"],0,0,0)["daily_signal_date"],"records":r["records"]} for r in rows]
+
+    def combined_day_symbols(self, start: int) -> int:
+        with self._lock:
+            return self._db.execute("""SELECT COUNT(*) FROM (
+                SELECT symbol FROM alert_daily_counts WHERE day_start=? UNION
+                SELECT symbol FROM indicator_research_events WHERE day_start=?)""",(start,start)).fetchone()[0]
+
+    def iter_indicator_day(self, start: int):
+        with self._lock:
+            rows = self._db.execute("SELECT payload FROM indicator_research_events WHERE day_start=? ORDER BY event_key",(start,)).fetchall()
+        for row in rows:
+            yield json.loads(row[0])
+
+    def day_alert_page(self, start: int, *, symbol: str | None = None,
+                       after: int = 0, limit: int = 2000, metadata: bool = False) -> dict:
+        """Append-only cursor: concurrent inserts cannot shift or skip older rows."""
+        projection = "json_remove(payload,'$.candles','$.indicators','$.indicator_context'" + (
+            ")" if metadata else ",'$.policy_snapshot','$.custom_indicator_snapshot')")
+        projection = score_projection(projection)
+        conditions = "close_time>=? AND close_time<? AND rowid>?"
+        params = [start, start + DAY_MS, after]
+        if symbol:
+            conditions += " AND symbol=?"
+            params.append(symbol)
+        limit = max(1, min(limit, 5000))
+        # Select cheap row identities before decoding large immutable chart payloads.
+        # Sorting projected JSON first can scan an entire busy day for every page.
+        sql = (f"SELECT rowid AS cursor,{projection} AS payload FROM alerts WHERE rowid IN "
+               f"(SELECT rowid FROM alerts WHERE {conditions} ORDER BY rowid LIMIT ?) ORDER BY rowid")
+        if self.path == ":memory:":
+            with self._lock:
+                rows = self._db.execute(sql, [*params, limit + 1]).fetchall()
+        else:
+            # Exports must never own the collector's write lock while reading a day.
+            reader = sqlite3.connect(Path(self.path).resolve().as_uri() + "?mode=ro", uri=True, timeout=15)
+            reader.row_factory = sqlite3.Row
+            try:
+                rows = reader.execute(sql, [*params, limit + 1]).fetchall()
+            finally:
+                reader.close()
+        page = rows[:limit]
+        return {"items": [refresh_saved(json.loads(row["payload"])) for row in page],
+                "cursor": page[-1]["cursor"] if page else after, "has_more": len(rows) > limit}
+
+    def iter_day_alerts(self, start: int, *, metadata: bool = False):
+        cursor = 0
+        while True:
+            page = self.day_alert_page(start, after=cursor, metadata=metadata)
+            yield from page["items"]
+            cursor = page["cursor"]
+            if not page["has_more"]:
+                break
 
     def reconcile_universe(self, metadata: list[dict], observed_at: int) -> list[dict]:
         """Persist official snapshots and emit each verified listing transition once.
@@ -563,6 +677,18 @@ class Store:
                            "last_seen": row["last_seen"], "snapshot_active": bool(row["active"])})
         return result
 
+    def market_day_rows(self, start: int, cutoff: int) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute("""WITH totals AS (
+                SELECT symbol, SUM(quote_volume) AS turnover, COUNT(*) AS bars,
+                       MIN(open_time) AS first_time, MAX(open_time) AS last_time
+                FROM candles WHERE timeframe='5m' AND closed=1 AND open_time>=? AND close_time<?
+                GROUP BY symbol)
+                SELECT t.*, f.open AS open_price, l.close AS last_price FROM totals t
+                JOIN candles f ON f.symbol=t.symbol AND f.timeframe='5m' AND f.open_time=t.first_time
+                JOIN candles l ON l.symbol=t.symbol AND l.timeframe='5m' AND l.open_time=t.last_time""",(start,cutoff)).fetchall()
+        return [dict(row) for row in rows]
+
     def list_listing_events(self, limit: int = 100) -> list[dict]:
         with self._lock:
             rows = self._db.execute("""SELECT events.payload AS event_payload,meta.payload AS metadata_payload
@@ -632,11 +758,24 @@ class Store:
         finally:
             database.close()
 
+    def save_market_evidence(self,symbol,close_time,evidence):
+        if evidence.get('evidence_as_of')!=close_time:
+            raise ValueError('Market evidence must match its close timestamp')
+        payload={k:evidence.get(k) for k in ('spread_bps','quote_time','liquidity_percentile','liquidity_bounds','evidence_as_of','evidence_observed_at')}
+        with self._lock,self._db:
+            self._db.execute('INSERT OR IGNORE INTO market_evidence VALUES(?,?,?)',(symbol,close_time,json.dumps(payload,separators=(',',':'))))
+
+    def get_market_evidence(self,symbol,close_time):
+        with self._lock:
+            row=self._db.execute('SELECT payload FROM market_evidence WHERE symbol=? AND close_time=?',(symbol,close_time)).fetchone()
+        return json.loads(row[0]) if row else {}
+
     def get_alert(self, alert_id: str) -> dict | None:
-        """Fetch exactly one persisted event; no recalculation or demo fallback."""
+        """Fetch immutable evidence; derive display scores from its frozen inputs only."""
         with self._lock:
             row = self._db.execute("SELECT payload FROM alerts WHERE event_key=?", (alert_id,)).fetchone()
-        result = json.loads(row[0]) if row else None
+            detail = self._db.execute("SELECT payload FROM alert_details WHERE event_key=?", (alert_id,)).fetchone() if row else None
+        result = restore_alert(json.loads(row[0]), detail[0] if detail else None) if row else None
         if result and (result.get("source", "live") != "live" or result.get("synthetic") is True):
             return None
         return self._enrich_daily_counts([result])[0] if result else None
@@ -683,12 +822,26 @@ class Store:
             db.close()
 
     def prune(self, now_ms: int) -> None:
-        """Keep two weeks of minutes, a year of intraday bars and 90 days of OI."""
-        day = 86_400_000
+        """Retain 30 days of market data/details, and small historical signal summaries."""
+        cutoff = now_ms - RETENTION_DAYS * DAY_MS
+        # Commit bounded batches so collection can continue between expired snapshots.
+        while True:
+            with self._lock, self._db:
+                rows = self._db.execute("SELECT event_key FROM alert_details WHERE close_time<? LIMIT 200", (cutoff,)).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    self._db.execute("""UPDATE alerts SET payload=json_set(json_remove(payload,
+                        '$.policy_snapshot','$.custom_indicator_snapshot'),'$.snapshot_expired',json('true'))
+                        WHERE event_key=?""", (row[0],))
+                    self._db.execute("DELETE FROM alert_details WHERE event_key=?", (row[0],))
         with self._lock, self._db:
-            self._db.execute("DELETE FROM candles WHERE timeframe='1m' AND open_time<?", (now_ms - 14 * day,))
-            self._db.execute("DELETE FROM candles WHERE timeframe NOT IN ('1m','1d') AND open_time<?", (now_ms - 366 * day,))
-            self._db.execute("DELETE FROM open_interest WHERE timestamp<?", (now_ms - 90 * day,))
+            self._db.execute("DELETE FROM candles WHERE open_time<" + candle_cutoff_sql(now_ms))
+            self._db.execute("DELETE FROM open_interest WHERE timestamp<?", (cutoff,))
+            self._db.execute("DELETE FROM market_evidence WHERE close_time<?", (cutoff,))
+            self._db.execute("DELETE FROM indicator_research_events WHERE day_start<?", (shanghai_day_start(cutoff),))
+        with self._lock:
+            self._db.execute("PRAGMA incremental_vacuum(4096)").fetchall()
 
     def close(self) -> None:
         with self._lock:
