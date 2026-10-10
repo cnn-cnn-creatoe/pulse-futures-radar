@@ -6,6 +6,7 @@ import {
   CloudDownload,
   RefreshCw,
   ShieldCheck,
+  Minus,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -30,9 +31,10 @@ type UpdateStatus = {
 type Props = {
   api: string | null;
   online: boolean;
+  hideButton?: boolean;
 };
 
-const CURRENT_VERSION = 'v3.0.4';
+const CURRENT_VERSION = 'v3.0.5';
 const UPDATE_POLL_MS = 30 * 60 * 1000;
 
 async function responseMessage(response: Response, fallback: string) {
@@ -44,7 +46,7 @@ async function responseMessage(response: Response, fallback: string) {
   return fallback;
 }
 
-export function UpdateControl({ api, online }: Props) {
+export function UpdateControl({ api, online, hideButton = false }: Props) {
   const [status, setStatus] = useState<UpdateStatus>({
     current_version: CURRENT_VERSION,
     latest_version: null,
@@ -57,12 +59,16 @@ export function UpdateControl({ api, online }: Props) {
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState('');
   const [progress, setProgress] = useState('');
+  const [completed, setCompleted] = useState('');
+  const pendingVersion = useRef('');
+  const busy = useRef(false);
   const mounted = useRef(true);
   const promptedVersion = useRef('');
   const reloadPoll = useRef<number | null>(null);
 
   const checkUpdate = useCallback(
     async (force = false) => {
+      if (busy.current) return;
       if (!api || !online) {
         setStatus((previous) => ({
           ...previous,
@@ -92,9 +98,11 @@ export function UpdateControl({ api, online }: Props) {
           value.update_available &&
           value.can_update &&
           value.latest_version &&
-          promptedVersion.current !== value.latest_version
+          promptedVersion.current !== value.latest_version &&
+          sessionStorage.getItem('pulse-update-prompted') !== value.latest_version
         ) {
           promptedVersion.current = value.latest_version;
+          sessionStorage.setItem('pulse-update-prompted', value.latest_version);
           setOpen(true);
         }
       } catch (reason) {
@@ -115,13 +123,73 @@ export function UpdateControl({ api, online }: Props) {
       mounted.current = false;
       window.clearTimeout(initial);
       window.clearInterval(timer);
-      if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
     };
   }, [checkUpdate]);
 
+  useEffect(() => {
+    const finished = sessionStorage.getItem('pulse-update-completed');
+    const pending = sessionStorage.getItem('pulse-update-pending');
+    if (finished) {
+      sessionStorage.removeItem('pulse-update-completed');
+      setCompleted(finished); setOpen(true);
+    } else if (pending) {
+      pendingVersion.current = pending; busy.current = true;
+      setUpdating(true); setProgress('正在恢复更新进度…');
+    }
+  }, []);
+
+  useEffect(() => {
+    const show = () => {setCompleted(''); setOpen(true); void checkUpdate(true);};
+    window.addEventListener('pulse-show-update', show);
+    return () => window.removeEventListener('pulse-show-update', show);
+  }, [checkUpdate]);
+
+  useEffect(() => {
+    if (!api || !updating) return;
+      const startedAt = Date.now();
+      if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
+      reloadPoll.current = window.setInterval(async () => {
+        try {
+          const check = await fetch(api + '/api/update/progress', {
+            cache: 'no-store',
+            signal: AbortSignal.timeout(4000),
+          });
+          if (!check.ok) return;
+          const value = (await check.json()) as {status:string; message?:string; version?:string};
+          setProgress(value.message || '正在更新…');
+          if (value.status === 'error') {
+            setError(value.message || '更新失败，请重试。');
+            setUpdating(false);
+            busy.current = false;
+            sessionStorage.removeItem('pulse-update-pending');
+            setOpen(true);
+            if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
+            reloadPoll.current = null;
+          } else if (value.status === 'complete' && value.version === pendingVersion.current) {
+            if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
+            reloadPoll.current = null;
+            sessionStorage.removeItem('pulse-update-pending');
+            sessionStorage.setItem('pulse-update-completed', value.version || pendingVersion.current);
+            window.location.reload();
+          }
+        } catch {
+          setProgress(Date.now() - startedAt > 600000
+            ? '服务尚未恢复，请检查 .runtime/update.log；不要重复启动更新。'
+            : '服务暂时离线，正在等待重启恢复…');
+        }
+      }, 3500);
+    return () => {
+      if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
+      reloadPoll.current = null;
+    };
+  }, [api, updating]);
+
   const applyUpdate = async () => {
     if (!api || !status.update_available || !status.can_update) return;
-    setUpdating(true);
+    if (busy.current) return;
+    busy.current = true;
+    pendingVersion.current = status.latest_version || '';
+    setCompleted('');
     setProgress('正在启动更新检查…');
     setError('');
     try {
@@ -133,6 +201,8 @@ export function UpdateControl({ api, online }: Props) {
       if (!response.ok)
         throw new Error(await responseMessage(response, '启动更新失败。'));
       const body = (await response.json()) as { message?: string };
+      sessionStorage.setItem('pulse-update-pending', pendingVersion.current);
+      setUpdating(true);
       setStatus((previous) => ({
         ...previous,
         message:
@@ -140,35 +210,11 @@ export function UpdateControl({ api, online }: Props) {
           '正在下载并更新；看板会短暂离线，完成后自动重新打开。',
       }));
 
-      const startedAt = Date.now();
-      if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
-      reloadPoll.current = window.setInterval(async () => {
-        try {
-          const check = await fetch(api + '/api/update/progress', {
-            cache: 'no-store',
-            signal: AbortSignal.timeout(4000),
-          });
-          if (!check.ok) return;
-          const value = (await check.json()) as {status:string; message?:string};
-          setProgress(value.message || '正在更新…');
-          if (value.status === 'error') {
-            setError(value.message || '更新失败，请重试。');
-            setUpdating(false);
-            if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
-            reloadPoll.current = null;
-          } else if (value.status === 'complete') {
-            if (reloadPoll.current !== null) window.clearInterval(reloadPoll.current);
-            reloadPoll.current = null;
-            window.location.reload();
-          }
-        } catch {
-          setProgress(Date.now() - startedAt > 600000
-            ? '服务尚未恢复，请检查 .runtime/update.log；不要重复启动更新。'
-            : '服务暂时离线，正在等待重启恢复…');
-        }
-      }, 3500);
+
     } catch (reason) {
       setUpdating(false);
+      busy.current = false;
+      sessionStorage.removeItem('pulse-update-pending');
       setError(reason instanceof Error ? reason.message : '启动更新失败。');
     }
   };
@@ -178,7 +224,7 @@ export function UpdateControl({ api, online }: Props) {
 
   return (
     <>
-      <Button
+      {!hideButton && <Button
         variant={hasUpdate ? 'default' : 'outline'}
         className={'update-check-button ' + (hasUpdate ? 'has-update' : '')}
         onClick={() => {
@@ -194,32 +240,34 @@ export function UpdateControl({ api, online }: Props) {
           <RefreshCw />
         )}
         {checking ? '正在检查…' : hasUpdate ? `更新 ${newest}` : '查看更新'}
-      </Button>
+      </Button>}
+      {updating && !open && <button className="update-mini" onClick={() => setOpen(true)} aria-label="展开更新进度"><RefreshCw className="spin"/><span>{progress}<small>点击展开 · 下载期间可继续查看信号</small></span></button>}
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="update-dialog">
+          <button className="update-minimize" aria-label="最小化更新窗口" title="最小化，继续查看信号" onClick={() => setOpen(false)}><Minus size={16}/></button>
           <DialogHeader>
             <span className={'update-dialog-icon ' + (hasUpdate ? 'has-update' : '')}>
               {hasUpdate ? <CloudDownload /> : <ShieldCheck />}
             </span>
-            <DialogTitle>{hasUpdate ? '发现新版本' : '应用更新'}</DialogTitle>
-            <DialogDescription>{error || status.message}</DialogDescription>
+            <DialogTitle>{completed ? '更新完成' : updating ? '正在更新' : hasUpdate ? '发现新版本' : '应用更新'}</DialogTitle>
+            <DialogDescription>{completed ? `已更新到 ${completed}，服务已恢复。` : error || status.message}</DialogDescription>
           </DialogHeader>
           <div className="update-version-row">
             <span>当前版本</span>
-            <b>{status.current_version || CURRENT_VERSION}</b>
+            <b>{completed || status.current_version || CURRENT_VERSION}</b>
             <span>最新版本</span>
             <b>{status.latest_version || '检查后显示'}</b>
           </div>
-          {updating && <p role="status" aria-live="polite">{progress}</p>}
+          {updating && <p role="status" aria-live="polite">{progress}<br/><small>下载时信号继续刷新；安装重启期间暂时停止刷新。</small></p>}
           <p className="update-preserve-note">
             更新只替换程序文件，本机历史行情、回测结果、Telegram 密钥和用户设置都会保留。
           </p>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)} disabled={updating}>
-              稍后
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              {completed ? '知道了' : updating ? '后台更新，继续看信号' : '稍后'}
             </Button>
-            {hasUpdate ? (
+            {!completed && (hasUpdate ? (
               <Button onClick={() => void applyUpdate()} disabled={updating}>
                 {updating ? <RefreshCw className="spin" /> : <CloudDownload />}
                 {updating ? '正在更新并重启…' : '下载并重启更新'}
@@ -229,7 +277,7 @@ export function UpdateControl({ api, online }: Props) {
                 {checking ? <RefreshCw className="spin" /> : <CheckCircle2 />}
                 {checking ? '正在检查…' : '重新检查'}
               </Button>
-            )}
+            ))}
           </DialogFooter>
         </DialogContent>
       </Dialog>

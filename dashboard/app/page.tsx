@@ -2307,7 +2307,7 @@ export default function Home() {
                   保存全部规则
                 </Button>
               )}
-              <UpdateControl api={api} online={apiOnline} />
+              <Button variant="outline" onClick={() => window.dispatchEvent(new Event('pulse-show-update'))}>查看更新</Button>
               <Button
                 variant="outline"
                 size="icon"
@@ -2710,7 +2710,7 @@ export default function Home() {
                   分。网络受限时保留可见的错误状态，不使用演示数据冒充实时结果。
                 </p>
               </div>
-<UpdateControl api={api} online={apiOnline}/></div></WorkspaceTabs>}
+<Button variant="outline" onClick={() => window.dispatchEvent(new Event('pulse-show-update'))}>查看更新</Button></div></WorkspaceTabs>}
           {view === 'universe' && <DataWorkspace api={api} online={apiOnline} />}
           {<SmcWorkspace active={view === 'smc'} standalone api={api}/>}
           {(view === 'history' || view === 'quant') && <ResearchWorkbench key="signals" api={api} online={apiOnline} signals />}
@@ -2730,6 +2730,7 @@ export default function Home() {
             </span>
           </footer>
         </div>
+        <UpdateControl api={api} online={apiOnline} hideButton />
       </main>
       <Dialog open={help} onOpenChange={setHelp}>
         <DialogContent className="help-dialog">

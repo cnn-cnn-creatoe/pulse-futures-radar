@@ -71,3 +71,8 @@
   margin: 0 -22px -22px;
   padding: 15px 22px;
 }
+
+.update-minimize { position:absolute; right:50px; top:16px; display:grid; place-items:center; width:28px; height:28px; border:1px solid #30495d; border-radius:6px; color:#cde2ef; background:transparent; cursor:pointer; }
+.update-mini { position:fixed; right:20px; bottom:20px; z-index:90; display:flex; align-items:center; gap:12px; max-width:min(440px,calc(100vw - 40px)); padding:14px 18px; color:#dce9f5; background:#142635; border:1px solid #4dd1bd; border-radius:12px; box-shadow:0 8px 28px #0006; text-align:left; cursor:pointer; }
+.update-mini small { display:block; color:#91adc3; margin-top:4px; }
+.update-mini svg { flex-shrink:0; width:18px; }

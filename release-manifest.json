@@ -1,5 +1,5 @@
 {
-  "version": "v3.0.4",
+  "version": "v3.0.5",
   "files": [
     ".gitattributes",
     ".gitignore",
@@ -296,6 +296,7 @@
     "RELEASE_NOTES_v3.0.2.md",
     "RELEASE_NOTES_v3.0.3.md",
     "RELEASE_NOTES_v3.0.4.md",
+    "RELEASE_NOTES_v3.0.5.md",
     "release-manifest.json",
     "release.json",
     "scripts/audit-score-calibration.py",
